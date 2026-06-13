@@ -10,7 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -23,6 +25,14 @@
 
 #define ARRAY_SIZE(x)	(sizeof(x) / sizeof((x)[0]))
 #define LOG_SIZE	65536
+#define PERF_PAGES	8
+
+struct event {
+	uint32_t kind;
+	uint32_t pad;
+	uint64_t pid_tgid;
+	char comm[16];
+};
 
 struct image {
 	void *data;
@@ -42,6 +52,13 @@ struct target {
 	int prog_fd;
 };
 
+struct perf_reader {
+	int fd;
+	void *base;
+	size_t len;
+	uint64_t tail;
+};
+
 static struct target targets[] = {
 	{ "bpf/syscall.o", "tracepoint/syscalls/sys_enter_execve",
 	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_execve", NULL, -1, -1 },
@@ -51,9 +68,49 @@ static struct target targets[] = {
 	  BPF_PROG_TYPE_KPROBE, "tcp_connect", "asm_ebpf", -1, -1 },
 };
 
+static int events_fd = -1;
+static struct perf_reader *readers;
+static int nr_readers;
+
 static int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr)
 {
 	return syscall(__NR_bpf, cmd, attr, sizeof(*attr));
+}
+
+static int create_perf_map(void)
+{
+	union bpf_attr attr;
+	long ncpu;
+
+	ncpu = sysconf(_SC_NPROCESSORS_CONF);
+	if (ncpu <= 0)
+		return -1;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_PERF_EVENT_ARRAY;
+	attr.key_size = sizeof(uint32_t);
+	attr.value_size = sizeof(uint32_t);
+	attr.max_entries = ncpu;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int patch_perf_map(struct bpf_insn *insns, size_t cnt, int map_fd)
+{
+	size_t i;
+
+	for (i = 0; i + 1 < cnt; i++) {
+		if (insns[i].code == (BPF_LD | BPF_DW | BPF_IMM) &&
+		    insns[i].dst_reg == BPF_REG_2 && !insns[i].src_reg &&
+		    !insns[i].imm && !insns[i + 1].imm) {
+			insns[i].src_reg = BPF_PSEUDO_MAP_FD;
+			insns[i].imm = map_fd;
+			return 0;
+		}
+	}
+
+	errno = ENOENT;
+	return -1;
 }
 
 static int sys_perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu,
@@ -67,6 +124,180 @@ static void close_fd(int *fd)
 	if (*fd >= 0)
 		close(*fd);
 	*fd = -1;
+}
+
+static void close_readers(void)
+{
+	int i;
+
+	for (i = 0; i < nr_readers; i++) {
+		if (readers[i].base)
+			munmap(readers[i].base, readers[i].len);
+		close_fd(&readers[i].fd);
+	}
+	free(readers);
+	readers = NULL;
+	nr_readers = 0;
+}
+
+static int update_map_elem(int map_fd, uint32_t key, uint32_t value)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_fd = map_fd;
+	attr.key = (uint64_t)&key;
+	attr.value = (uint64_t)&value;
+	attr.flags = BPF_ANY;
+
+	return sys_bpf(BPF_MAP_UPDATE_ELEM, &attr);
+}
+
+static int open_perf_readers(void)
+{
+	struct perf_event_attr attr;
+	long page_size;
+	int cpu;
+
+	nr_readers = sysconf(_SC_NPROCESSORS_CONF);
+	if (nr_readers <= 0)
+		return -1;
+	page_size = sysconf(_SC_PAGESIZE);
+	if (page_size <= 0)
+		return -1;
+
+	readers = calloc(nr_readers, sizeof(*readers));
+	if (!readers)
+		return -1;
+	for (cpu = 0; cpu < nr_readers; cpu++)
+		readers[cpu].fd = -1;
+
+	for (cpu = 0; cpu < nr_readers; cpu++) {
+		memset(&attr, 0, sizeof(attr));
+		attr.type = PERF_TYPE_SOFTWARE;
+		attr.size = sizeof(attr);
+		attr.config = PERF_COUNT_SW_BPF_OUTPUT;
+		attr.sample_type = PERF_SAMPLE_RAW;
+		attr.wakeup_events = 1;
+
+		readers[cpu].fd = sys_perf_event_open(&attr, -1, cpu, -1,
+						       PERF_FLAG_FD_CLOEXEC);
+		if (readers[cpu].fd < 0)
+			goto err;
+
+		readers[cpu].len = page_size * (PERF_PAGES + 1);
+		readers[cpu].base = mmap(NULL, readers[cpu].len,
+					      PROT_READ | PROT_WRITE, MAP_SHARED,
+					      readers[cpu].fd, 0);
+		if (readers[cpu].base == MAP_FAILED) {
+			readers[cpu].base = NULL;
+			goto err;
+		}
+		if (ioctl(readers[cpu].fd, PERF_EVENT_IOC_ENABLE, 0))
+			goto err;
+		if (update_map_elem(events_fd, cpu, readers[cpu].fd))
+			goto err;
+	}
+
+	return 0;
+
+err:
+	close_readers();
+	return -1;
+}
+
+static void print_event(const struct event *event)
+{
+	const char *kind = "unknown";
+
+	if (event->kind == 1)
+		kind = "exec";
+	else if (event->kind == 2)
+		kind = "exit";
+	else if (event->kind == 3)
+		kind = "tcp";
+
+	printf("%-5s pid=%llu tid=%llu comm=%.*s\n", kind,
+	       (unsigned long long)(event->pid_tgid >> 32),
+	       (unsigned long long)(event->pid_tgid & 0xffffffff),
+	       (int)sizeof(event->comm), event->comm);
+}
+
+static void read_one(struct perf_reader *reader)
+{
+	struct perf_event_mmap_page *meta = reader->base;
+	char *data = (char *)reader->base + sysconf(_SC_PAGESIZE);
+	size_t data_size = reader->len - sysconf(_SC_PAGESIZE);
+	uint64_t head = meta->data_head;
+
+	__sync_synchronize();
+	while (reader->tail < head) {
+		struct perf_event_header *hdr;
+		char buf[256];
+		size_t offset, len, first;
+
+		offset = reader->tail % data_size;
+		first = data_size - offset;
+		if (first >= sizeof(*hdr)) {
+			hdr = (void *)(data + offset);
+		} else {
+			memcpy(buf, data + offset, first);
+			memcpy(buf + first, data, sizeof(*hdr) - first);
+			hdr = (void *)buf;
+		}
+
+		if (!hdr->size || hdr->size > sizeof(buf))
+			break;
+
+		len = hdr->size;
+		if (first >= len) {
+			memcpy(buf, data + offset, len);
+		} else {
+			memcpy(buf, data + offset, first);
+			memcpy(buf + first, data, len - first);
+		}
+
+		if (hdr->type == PERF_RECORD_SAMPLE && len >= sizeof(*hdr) + 4) {
+			uint32_t raw_len;
+
+			memcpy(&raw_len, buf + sizeof(*hdr), sizeof(raw_len));
+			if (raw_len >= sizeof(struct event) &&
+			    sizeof(*hdr) + 4 + raw_len <= len)
+				print_event((void *)(buf + sizeof(*hdr) + 4));
+		}
+
+		reader->tail += hdr->size;
+	}
+	meta->data_tail = reader->tail;
+}
+
+static int event_loop(void)
+{
+	struct pollfd *fds;
+	int i;
+
+	fds = calloc(nr_readers, sizeof(*fds));
+	if (!fds)
+		return -1;
+	for (i = 0; i < nr_readers; i++) {
+		fds[i].fd = readers[i].fd;
+		fds[i].events = POLLIN;
+	}
+
+	for (;;) {
+		if (poll(fds, nr_readers, -1) < 0) {
+			if (errno == EINTR)
+				break;
+			free(fds);
+			return -1;
+		}
+		for (i = 0; i < nr_readers; i++)
+			if (fds[i].revents & POLLIN)
+				read_one(&readers[i]);
+	}
+
+	free(fds);
+	return 0;
 }
 
 static int read_file(const char *path, struct image *img)
@@ -182,6 +413,9 @@ static int load_program(struct target *target)
 	memset(log, 0, sizeof(log));
 	attr.prog_type = target->type;
 	attr.insn_cnt = prog->sh_size / sizeof(struct bpf_insn);
+	if (patch_perf_map((void *)((char *)img.data + prog->sh_offset),
+			   attr.insn_cnt, events_fd))
+		goto err;
 	attr.insns = (uint64_t)((char *)img.data + prog->sh_offset);
 	attr.license = (uint64_t)((char *)img.data + license->sh_offset);
 	attr.log_buf = (uint64_t)log;
@@ -300,6 +534,17 @@ static int attach_kprobe(struct target *target)
 	return attach_event(target, event_path);
 }
 
+static void remove_kprobe(struct target *target)
+{
+	char spec[128];
+
+	if (!target->kgroup)
+		return;
+	snprintf(spec, sizeof(spec), "-:%s/%s\n", target->kgroup, target->event);
+	write_file("/sys/kernel/tracing/kprobe_events", spec);
+	write_file("/sys/kernel/debug/tracing/kprobe_events", spec);
+}
+
 static int attach_program(struct target *target)
 {
 	if (target->type == BPF_PROG_TYPE_TRACEPOINT)
@@ -317,12 +562,27 @@ static void detach_all(void)
 	for (i = 0; i < ARRAY_SIZE(targets); i++) {
 		close_fd(&targets[i].perf_fd);
 		close_fd(&targets[i].prog_fd);
+		remove_kprobe(&targets[i]);
 	}
+	close_readers();
+	close_fd(&events_fd);
 }
 
 int main(void)
 {
 	size_t i;
+	int ret = 0;
+
+	events_fd = create_perf_map();
+	if (events_fd < 0) {
+		perror("events map");
+		return 1;
+	}
+	if (open_perf_readers()) {
+		perror("perf readers");
+		detach_all();
+		return 1;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(targets); i++) {
 		if (load_program(&targets[i])) {
@@ -338,7 +598,9 @@ int main(void)
 		printf("attached %s\n", targets[i].sec);
 	}
 
-	pause();
+	ret = event_loop();
+	if (ret)
+		perror("poll");
 	detach_all();
-	return 0;
+	return ret ? 1 : 0;
 }
