@@ -119,6 +119,17 @@ static int sys_perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu,
 	return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
 
+static void die_errno(const char *what)
+{
+	int saved_errno = errno;
+
+	perror(what);
+	if (saved_errno == EPERM || saved_errno == EACCES) {
+		fprintf(stderr, "run as root or grant BPF tracing capabilities\n");
+		fprintf(stderr, "check kernel.unprivileged_bpf_disabled and perf_event_paranoid\n");
+	}
+}
+
 static void close_fd(int *fd)
 {
 	if (*fd >= 0)
@@ -575,23 +586,23 @@ int main(void)
 
 	events_fd = create_perf_map();
 	if (events_fd < 0) {
-		perror("events map");
+		die_errno("events map");
 		return 1;
 	}
 	if (open_perf_readers()) {
-		perror("perf readers");
+		die_errno("perf readers");
 		detach_all();
 		return 1;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(targets); i++) {
 		if (load_program(&targets[i])) {
-			perror(targets[i].obj);
+			die_errno(targets[i].obj);
 			detach_all();
 			return 1;
 		}
 		if (attach_program(&targets[i])) {
-			perror(targets[i].sec);
+			die_errno(targets[i].sec);
 			detach_all();
 			return 1;
 		}
@@ -600,7 +611,7 @@ int main(void)
 
 	ret = event_loop();
 	if (ret)
-		perror("poll");
+		die_errno("poll");
 	detach_all();
 	return ret ? 1 : 0;
 }
