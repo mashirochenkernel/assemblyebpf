@@ -1,0 +1,58 @@
+Assembly eBPF
+=============
+
+This is a hand-written eBPF tool tree.  The eBPF programs are assembly
+source files.  The build is plain make.
+
+The first target is a set of small tracing programs that can grow into a
+full system inspection tool: process activity, files, network paths, and
+kernel events.  The eBPF side stays assembly.
+
+
+BUILDING
+--------
+
+Preferred assembler:
+
+        bpf-unknown-none-as
+
+Build with a BPF GNU assembler:
+
+        make
+
+If the BPF GNU assembler is not installed, clang can assemble the same eBPF
+sources:
+
+        make LLVM=1
+
+Inspect generated objects:
+
+        make dump
+
+Clean generated files:
+
+        make clean
+
+
+TOOLCHAIN
+---------
+
+GNU as works only when binutils was built with the BPF target.  A normal host
+assembler such as /usr/bin/as for x86_64 is not enough.
+
+Common package names to look for:
+
+        binutils-bpf
+        binutils-bpf-unknown-none
+        bpf-unknown-none-binutils
+
+Some distributions do not ship this target.  In that case build binutils with:
+
+        --target=bpf-unknown-none
+
+and make sure bpf-unknown-none-as is in PATH.
+
+Clang support needs a build with the BPF backend enabled.  The command used by
+this tree is:
+
+        clang -target bpf -x assembler-with-cpp

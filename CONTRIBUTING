@@ -1,0 +1,59 @@
+Contributing
+============
+
+Keep changes small.  Each commit must do one thing.
+
+
+SOURCE STYLE
+------------
+
+Every source file starts with an SPDX line:
+
+        /* SPDX-License-Identifier: GPL-2.0 */
+
+Assembly source files use the syntax accepted by the BPF assembler.  For LLVM
+and modern binutils this looks like:
+
+        r0 = 0
+        exit
+
+Do not add banner comments.  Do not describe obvious instructions.  Add a
+comment only when it records a verifier constraint, ABI rule, or kernel rule
+that is not obvious from the instruction stream.
+
+Keep labels local unless the loader needs the symbol.  Keep section names
+explicit and stable.
+
+
+COMMITS
+-------
+
+Use this subject form:
+
+        area: change summary
+
+Examples:
+
+        bpf: add syscall entry tracepoint program
+        build: add BPF assembler rules
+        docs: describe BPF binutils requirement
+
+The subject is lowercase after the area, imperative where possible, and no
+longer than 75 columns.
+
+The body explains why the change is needed.  Mention verifier limits, ABI
+requirements, loader-visible behavior, and compatibility constraints when they
+matter.  Do not repeat the diff.
+
+End with trailers when appropriate:
+
+        Signed-off-by: Name <mail@example.com>
+
+
+ATOMIC CHANGES
+--------------
+
+A commit that adds one program does not also reformat unrelated files.  A
+commit that changes build rules does not also change tracing behavior.  A
+commit that fixes a verifier problem describes the failing condition and the
+instruction-level fix.
