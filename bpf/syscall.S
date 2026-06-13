@@ -11,6 +11,8 @@ trace_execve:
 	add %r1, -16
 	mov %r2, 16
 	call 16
+	mov %r1, 0
+	stxdw [%r10+-32], %r1
 	mov %r1, 1
 	stxw [%r10+-32], %r1
 	stxdw [%r10+-24], %r7
