@@ -34,6 +34,17 @@ Clean generated files:
         make clean
 
 
+RUNNING
+-------
+
+The asm-ebpf loader loads and attaches the assembled programs:
+
+        su -c ./asm-ebpf
+
+It keeps running until interrupted.  It needs the usual privileges for loading
+eBPF programs and opening tracing events.
+
+
 TOOLCHAIN
 ---------
 
