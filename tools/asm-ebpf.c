@@ -535,7 +535,7 @@ static int attach_event(struct target *target, const char *event)
 {
 	char path[256];
 	struct perf_event_attr attr;
-	int cpu, id, ncpu;
+	int cpu, err, id, ncpu, attached = 0;
 
 	snprintf(path, sizeof(path),
 		 "/sys/kernel/tracing/events/%s/id", event);
@@ -571,10 +571,29 @@ static int attach_event(struct target *target, const char *event)
 		if (target->perf_fds[cpu] < 0)
 			return -1;
 		if (ioctl(target->perf_fds[cpu], PERF_EVENT_IOC_SET_BPF,
-			  target->prog_fd))
+			  target->prog_fd)) {
+			err = errno;
+			close_fd(&target->perf_fds[cpu]);
+			if (err == EEXIST) {
+				fprintf(stderr, "skip %s cpu %d: already attached\n",
+					target->sec, cpu);
+				continue;
+			}
+			errno = err;
 			return -1;
-		if (ioctl(target->perf_fds[cpu], PERF_EVENT_IOC_ENABLE, 0))
+		}
+		if (ioctl(target->perf_fds[cpu], PERF_EVENT_IOC_ENABLE, 0)) {
+			err = errno;
+			close_fd(&target->perf_fds[cpu]);
+			errno = err;
 			return -1;
+		}
+		attached++;
+	}
+
+	if (!attached) {
+		errno = EEXIST;
+		return -1;
 	}
 
 	return 0;
@@ -638,7 +657,7 @@ static int attach_program(struct target *target)
 static int can_skip(int err)
 {
 	return err == ENOENT || err == ENODEV || err == EINVAL ||
-	       err == EOPNOTSUPP || err == ENOSYS;
+	       err == EOPNOTSUPP || err == ENOSYS || err == EEXIST;
 }
 
 static void close_target(struct target *target)
