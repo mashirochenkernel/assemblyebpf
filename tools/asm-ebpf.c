@@ -61,6 +61,8 @@ struct perf_reader {
 	int fd;
 	void *base;
 	size_t len;
+	size_t data_offset;
+	size_t data_size;
 	uint64_t tail;
 };
 
@@ -135,6 +137,9 @@ static const char *event_names[] = {
 static int events_fd = -1;
 static struct perf_reader *readers;
 static int nr_readers;
+static int reported_bad_sample;
+static int reported_lost;
+static int reported_record;
 
 static int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr)
 {
@@ -269,6 +274,8 @@ static int open_perf_readers(void)
 			readers[cpu].base = NULL;
 			goto err;
 		}
+		readers[cpu].data_offset = page_size;
+		readers[cpu].data_size = page_size * PERF_PAGES;
 		if (ioctl(readers[cpu].fd, PERF_EVENT_IOC_ENABLE, 0))
 			goto err;
 		if (update_map_elem(events_fd, cpu, readers[cpu].fd))
@@ -298,9 +305,16 @@ static void print_event(const struct event *event)
 static void read_one(struct perf_reader *reader)
 {
 	struct perf_event_mmap_page *meta = reader->base;
-	char *data = (char *)reader->base + sysconf(_SC_PAGESIZE);
-	size_t data_size = reader->len - sysconf(_SC_PAGESIZE);
+	size_t data_offset = meta->data_offset;
+	size_t data_size = meta->data_size;
+	char *data;
 	uint64_t head = meta->data_head;
+
+	if (!data_offset || !data_size) {
+		data_offset = reader->data_offset;
+		data_size = reader->data_size;
+	}
+	data = (char *)reader->base + data_offset;
 
 	__sync_synchronize();
 	while (reader->tail < head) {
@@ -336,6 +350,20 @@ static void read_one(struct perf_reader *reader)
 			if (raw_len >= sizeof(struct event) &&
 			    sizeof(*hdr) + 4 + raw_len <= len)
 				print_event((void *)(buf + sizeof(*hdr) + 4));
+			else if (!reported_bad_sample) {
+				fprintf(stderr, "bad sample size %u record %zu\n",
+					raw_len, len);
+				reported_bad_sample = 1;
+			}
+		} else if (hdr->type == PERF_RECORD_LOST) {
+			if (!reported_lost) {
+				fprintf(stderr, "lost perf records\n");
+				reported_lost = 1;
+			}
+		} else if (!reported_record) {
+			fprintf(stderr, "perf record type %u size %u\n",
+				hdr->type, hdr->size);
+			reported_record = 1;
 		}
 
 		reader->tail += hdr->size;
