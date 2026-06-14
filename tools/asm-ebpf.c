@@ -64,6 +64,8 @@ static struct target targets[] = {
 	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_execve", NULL, -1, -1 },
 	{ "bpf/process.o", "tracepoint/sched/sched_process_exit",
 	  BPF_PROG_TYPE_TRACEPOINT, "sched/sched_process_exit", NULL, -1, -1 },
+	{ "bpf/file.o", "tracepoint/syscalls/sys_enter_openat",
+	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_openat", NULL, -1, -1 },
 	{ "bpf/net.o", "kprobe/tcp_connect",
 	  BPF_PROG_TYPE_KPROBE, "tcp_connect", "asm_ebpf", -1, -1 },
 };
@@ -227,6 +229,8 @@ static void print_event(const struct event *event)
 		kind = "exit";
 	else if (event->kind == 3)
 		kind = "tcp";
+	else if (event->kind == 4)
+		kind = "file";
 
 	printf("%-5s pid=%llu tid=%llu comm=%.*s\n", kind,
 	       (unsigned long long)(event->pid_tgid >> 32),
