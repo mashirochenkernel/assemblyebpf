@@ -72,6 +72,14 @@ static struct target targets[] = {
 	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_write", NULL, -1, -1 },
 	{ "bpf/io.o", "tracepoint/syscalls/sys_enter_close",
 	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_close", NULL, -1, -1 },
+	{ "bpf/socket.o", "tracepoint/syscalls/sys_enter_connect",
+	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_connect", NULL, -1, -1 },
+	{ "bpf/socket.o", "tracepoint/syscalls/sys_enter_accept4",
+	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_accept4", NULL, -1, -1 },
+	{ "bpf/socket.o", "tracepoint/syscalls/sys_enter_sendto",
+	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_sendto", NULL, -1, -1 },
+	{ "bpf/socket.o", "tracepoint/syscalls/sys_enter_recvfrom",
+	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_recvfrom", NULL, -1, -1 },
 	{ "bpf/net.o", "kprobe/tcp_connect",
 	  BPF_PROG_TYPE_KPROBE, "tcp_connect", "asm_ebpf", -1, -1 },
 };
@@ -243,6 +251,14 @@ static void print_event(const struct event *event)
 		kind = "write";
 	else if (event->kind == 7)
 		kind = "close";
+	else if (event->kind == 8)
+		kind = "conn";
+	else if (event->kind == 9)
+		kind = "accept";
+	else if (event->kind == 10)
+		kind = "send";
+	else if (event->kind == 11)
+		kind = "recv";
 
 	printf("%-5s pid=%llu tid=%llu comm=%.*s\n", kind,
 	       (unsigned long long)(event->pid_tgid >> 32),
