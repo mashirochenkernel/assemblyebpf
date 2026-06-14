@@ -27,9 +27,9 @@
 #define LOG_SIZE	65536
 #define PERF_PAGES	8
 #define TP(obj, name) \
-	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, NULL, 0, -1 }
+	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, NULL, NULL, 0 }
 #define KP(obj, group, name) \
-	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, NULL, 0, -1 }
+	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, NULL, NULL, 0 }
 
 struct event {
 	uint32_t kind;
@@ -53,8 +53,8 @@ struct target {
 	const char *event;
 	const char *kgroup;
 	int *perf_fds;
-	int nr_perf_fds;
-	int prog_fd;
+	int *prog_fds;
+	int nr_fds;
 };
 
 struct perf_reader {
@@ -499,9 +499,8 @@ static int load_program(struct target *target)
 	if (fd < 0)
 		goto err;
 
-	target->prog_fd = fd;
 	free(img.data);
-	return 0;
+	return fd;
 
 err:
 	free(img.data);
@@ -552,11 +551,19 @@ static int attach_event(struct target *target, const char *event)
 		return -1;
 
 	target->perf_fds = calloc(ncpu, sizeof(*target->perf_fds));
-	if (!target->perf_fds)
+	target->prog_fds = calloc(ncpu, sizeof(*target->prog_fds));
+	if (!target->perf_fds || !target->prog_fds) {
+		free(target->perf_fds);
+		free(target->prog_fds);
+		target->perf_fds = NULL;
+		target->prog_fds = NULL;
 		return -1;
-	target->nr_perf_fds = ncpu;
-	for (cpu = 0; cpu < ncpu; cpu++)
+	}
+	target->nr_fds = ncpu;
+	for (cpu = 0; cpu < ncpu; cpu++) {
 		target->perf_fds[cpu] = -1;
+		target->prog_fds[cpu] = -1;
+	}
 
 	memset(&attr, 0, sizeof(attr));
 	attr.type = PERF_TYPE_TRACEPOINT;
@@ -566,14 +573,18 @@ static int attach_event(struct target *target, const char *event)
 	attr.wakeup_events = 1;
 
 	for (cpu = 0; cpu < ncpu; cpu++) {
+		target->prog_fds[cpu] = load_program(target);
+		if (target->prog_fds[cpu] < 0)
+			return -1;
 		target->perf_fds[cpu] = sys_perf_event_open(&attr, -1, cpu, -1,
 							PERF_FLAG_FD_CLOEXEC);
 		if (target->perf_fds[cpu] < 0)
 			return -1;
 		if (ioctl(target->perf_fds[cpu], PERF_EVENT_IOC_SET_BPF,
-			  target->prog_fd)) {
+			  target->prog_fds[cpu])) {
 			err = errno;
 			close_fd(&target->perf_fds[cpu]);
+			close_fd(&target->prog_fds[cpu]);
 			if (err == EEXIST) {
 				fprintf(stderr, "skip %s cpu %d: already attached\n",
 					target->sec, cpu);
@@ -585,6 +596,7 @@ static int attach_event(struct target *target, const char *event)
 		if (ioctl(target->perf_fds[cpu], PERF_EVENT_IOC_ENABLE, 0)) {
 			err = errno;
 			close_fd(&target->perf_fds[cpu]);
+			close_fd(&target->prog_fds[cpu]);
 			errno = err;
 			return -1;
 		}
@@ -664,12 +676,15 @@ static void close_target(struct target *target)
 {
 	int i;
 
-	for (i = 0; i < target->nr_perf_fds; i++)
+	for (i = 0; i < target->nr_fds; i++)
 		close_fd(&target->perf_fds[i]);
+	for (i = 0; i < target->nr_fds; i++)
+		close_fd(&target->prog_fds[i]);
 	free(target->perf_fds);
+	free(target->prog_fds);
 	target->perf_fds = NULL;
-	target->nr_perf_fds = 0;
-	close_fd(&target->prog_fd);
+	target->prog_fds = NULL;
+	target->nr_fds = 0;
 	remove_kprobe(target);
 }
 
@@ -702,11 +717,6 @@ int main(void)
 	}
 
 	for (i = 0; i < ARRAY_SIZE(targets); i++) {
-		if (load_program(&targets[i])) {
-			die_errno(targets[i].obj);
-			detach_all();
-			return 1;
-		}
 		if (attach_program(&targets[i])) {
 			if (can_skip(errno)) {
 				fprintf(stderr, "skip %s: %s\n", targets[i].sec,
