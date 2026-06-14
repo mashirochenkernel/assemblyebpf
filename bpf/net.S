@@ -1,34 +1,29 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
+	.include "bpf/event.inc"
+
 	.section "kprobe/tcp_connect", "ax"
 	.global trace_tcp_connect
 trace_tcp_connect:
-	mov %r6, %r1
-	mov %r1, 3
-	call 14
-	mov %r7, %r0
+	event_head 3
+	ldxdw %r8, [%r6+112]
 	mov %r1, %r10
-	add %r1, -16
-	mov %r2, 16
-	call 16
-	mov %r1, 0
-	stxdw [%r10+-32], %r1
-	mov %r1, 3
-	stxw [%r10+-32], %r1
-	stxdw [%r10+-24], %r7
-	ldxdw %r1, [%r10+-16]
-	stxdw [%r10+-16], %r1
-	ldxdw %r1, [%r10+-8]
-	stxdw [%r10+-8], %r1
-	mov %r1, %r6
-	lddw %r2, 0
-	mov %r3, 0xffffffff
-	mov %r4, %r10
-	add %r4, -32
-	mov %r5, 32
-	call 25
-	mov %r0, 0
-	exit
+	add %r1, -184
+	mov %r2, 4
+	mov %r3, %r8
+	call 113
+	mov %r1, %r10
+	add %r1, -188
+	mov %r2, 2
+	mov %r3, %r8
+	add %r3, 12
+	call 113
+	ldxw %r1, [%r10+-184]
+	ldxh %r2, [%r10+-188]
+	lsh %r2, 32
+	or %r1, %r2
+	stxdw [%r10+-152], %r1
+	event_out 40
 
 	.section "license", "a"
 _license:

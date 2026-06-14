@@ -5,17 +5,17 @@
 	.section "tracepoint/syscalls/sys_enter_read", "ax"
 	.global trace_read
 trace_read:
-	emit_event 5
+	emit_aux 5, 16
 
 	.section "tracepoint/syscalls/sys_enter_write", "ax"
 	.global trace_write
 trace_write:
-	emit_event 6
+	emit_aux 6, 16
 
 	.section "tracepoint/syscalls/sys_enter_close", "ax"
 	.global trace_close
 trace_close:
-	emit_event 7
+	emit_aux 7, 16
 
 	.section "license", "a"
 _license:

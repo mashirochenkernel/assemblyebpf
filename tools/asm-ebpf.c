@@ -3,9 +3,11 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
 #include <linux/unistd.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +37,16 @@ struct event {
 	uint32_t kind;
 	uint32_t pad;
 	uint64_t pid_tgid;
+	uint64_t aux;
+	char comm[16];
+	char arg[128];
+};
+
+#define EVENT_HEAD	offsetof(struct event, arg)
+
+struct filter {
+	uint32_t pid;
+	uint32_t have_comm;
 	char comm[16];
 };
 
@@ -100,41 +112,46 @@ static struct target targets[] = {
 	KP("bpf/net.o", "asm_ebpf", "tcp_connect"),
 };
 
-static const char *event_names[] = {
-	[1] = "exec",
-	[2] = "exit",
-	[3] = "tcp",
-	[4] = "file",
-	[5] = "read",
-	[6] = "write",
-	[7] = "close",
-	[8] = "conn",
-	[9] = "accept",
-	[10] = "send",
-	[11] = "recv",
-	[12] = "stat",
-	[13] = "unlink",
-	[14] = "rename",
-	[15] = "mkdir",
-	[16] = "rmdir",
-	[17] = "chmod",
-	[18] = "chown",
-	[19] = "clone",
-	[20] = "clone3",
-	[21] = "fork",
-	[22] = "vfork",
-	[23] = "exitg",
-	[24] = "kill",
-	[25] = "tkill",
-	[26] = "tgkill",
-	[27] = "prctl",
-	[28] = "mmap",
-	[29] = "mprot",
-	[30] = "munmap",
-	[31] = "brk",
+static const struct evdesc {
+	const char *name;
+	const char *label;
+} evdescs[] = {
+	[1]  = { "exec",   NULL },
+	[2]  = { "exit",   NULL },
+	[3]  = { "tcp",    NULL },
+	[4]  = { "open",   NULL },
+	[5]  = { "read",   "fd" },
+	[6]  = { "write",  "fd" },
+	[7]  = { "close",  "fd" },
+	[8]  = { "conn",   "fd" },
+	[9]  = { "accept", "fd" },
+	[10] = { "send",   "fd" },
+	[11] = { "recv",   "fd" },
+	[12] = { "stat",   NULL },
+	[13] = { "unlink", NULL },
+	[14] = { "rename", NULL },
+	[15] = { "mkdir",  NULL },
+	[16] = { "rmdir",  NULL },
+	[17] = { "chmod",  NULL },
+	[18] = { "chown",  NULL },
+	[19] = { "clone",  "flags" },
+	[20] = { "clone3", NULL },
+	[21] = { "fork",   NULL },
+	[22] = { "vfork",  NULL },
+	[23] = { "exitg",  "code" },
+	[24] = { "kill",   "sig" },
+	[25] = { "tkill",  "sig" },
+	[26] = { "tgkill", "sig" },
+	[27] = { "prctl",  "opt" },
+	[28] = { "mmap",   "len" },
+	[29] = { "mprot",  "len" },
+	[30] = { "munmap", "len" },
+	[31] = { "brk",    "addr" },
 };
 
 static int events_fd = -1;
+static int config_fd = -1;
+static int self_pid;
 static struct perf_reader *readers;
 static int nr_readers;
 static int reported_bad_sample;
@@ -164,6 +181,33 @@ static int create_perf_map(void)
 	return sys_bpf(BPF_MAP_CREATE, &attr);
 }
 
+static int create_filter_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_ARRAY;
+	attr.key_size = sizeof(uint32_t);
+	attr.value_size = sizeof(struct filter);
+	attr.max_entries = 1;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int set_filter(int map_fd, const struct filter *filter)
+{
+	union bpf_attr attr;
+	uint32_t key = 0;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_fd = map_fd;
+	attr.key = (uint64_t)&key;
+	attr.value = (uint64_t)filter;
+	attr.flags = BPF_ANY;
+
+	return sys_bpf(BPF_MAP_UPDATE_ELEM, &attr);
+}
+
 static int patch_perf_map(struct bpf_insn *insns, size_t cnt, int map_fd)
 {
 	size_t i;
@@ -171,6 +215,41 @@ static int patch_perf_map(struct bpf_insn *insns, size_t cnt, int map_fd)
 	for (i = 0; i + 1 < cnt; i++) {
 		if (insns[i].code == (BPF_LD | BPF_DW | BPF_IMM) &&
 		    insns[i].dst_reg == BPF_REG_2 && !insns[i].src_reg &&
+		    !insns[i].imm && !insns[i + 1].imm) {
+			insns[i].src_reg = BPF_PSEUDO_MAP_FD;
+			insns[i].imm = map_fd;
+			return 0;
+		}
+	}
+
+	errno = ENOENT;
+	return -1;
+}
+
+static int patch_self_pid(struct bpf_insn *insns, size_t cnt, int pid)
+{
+	size_t i;
+
+	for (i = 0; i < cnt; i++) {
+		if (insns[i].code == (BPF_JMP | BPF_JNE | BPF_K) &&
+		    insns[i].dst_reg == BPF_REG_1 && !insns[i].src_reg &&
+		    !insns[i].imm) {
+			insns[i].imm = pid;
+			return 0;
+		}
+	}
+
+	errno = ENOENT;
+	return -1;
+}
+
+static int patch_config_map(struct bpf_insn *insns, size_t cnt, int map_fd)
+{
+	size_t i;
+
+	for (i = 0; i + 1 < cnt; i++) {
+		if (insns[i].code == (BPF_LD | BPF_DW | BPF_IMM) &&
+		    insns[i].dst_reg == BPF_REG_1 && !insns[i].src_reg &&
 		    !insns[i].imm && !insns[i + 1].imm) {
 			insns[i].src_reg = BPF_PSEUDO_MAP_FD;
 			insns[i].imm = map_fd;
@@ -289,17 +368,33 @@ err:
 	return -1;
 }
 
-static void print_event(const struct event *event)
+static void print_event(const struct event *event, int has_arg)
 {
-	const char *kind = "unknown";
+	const struct evdesc *desc = NULL;
 
-	if (event->kind < ARRAY_SIZE(event_names) && event_names[event->kind])
-		kind = event_names[event->kind];
+	if (event->kind < ARRAY_SIZE(evdescs))
+		desc = &evdescs[event->kind];
 
-	printf("%-5s pid=%llu tid=%llu comm=%.*s\n", kind,
+	printf("%-6s pid=%llu tid=%llu comm=%.*s",
+	       desc && desc->name ? desc->name : "unknown",
 	       (unsigned long long)(event->pid_tgid >> 32),
 	       (unsigned long long)(event->pid_tgid & 0xffffffff),
 	       (int)sizeof(event->comm), event->comm);
+
+	if (has_arg) {
+		printf(" %.*s", (int)sizeof(event->arg), event->arg);
+	} else if (event->kind == 3) {
+		uint32_t daddr = event->aux & 0xffffffff;
+		uint16_t dport = (event->aux >> 32) & 0xffff;
+		const unsigned char *b = (const unsigned char *)&daddr;
+
+		printf(" %u.%u.%u.%u:%u", b[0], b[1], b[2], b[3],
+		       ntohs(dport));
+	} else if (desc && desc->label) {
+		printf(" %s=%llu", desc->label,
+		       (unsigned long long)event->aux);
+	}
+	putchar('\n');
 }
 
 static void read_one(struct perf_reader *reader)
@@ -347,9 +442,11 @@ static void read_one(struct perf_reader *reader)
 			uint32_t raw_len;
 
 			memcpy(&raw_len, buf + sizeof(*hdr), sizeof(raw_len));
-			if (raw_len >= sizeof(struct event) &&
+			if (raw_len >= EVENT_HEAD &&
+			    raw_len <= sizeof(struct event) &&
 			    sizeof(*hdr) + 4 + raw_len <= len)
-				print_event((void *)(buf + sizeof(*hdr) + 4));
+				print_event((void *)(buf + sizeof(*hdr) + 4),
+					    raw_len >= sizeof(struct event));
 			else if (!reported_bad_sample) {
 				fprintf(stderr, "bad sample size %u record %zu\n",
 					raw_len, len);
@@ -514,6 +611,12 @@ static int load_program(struct target *target)
 	attr.insn_cnt = prog->sh_size / sizeof(struct bpf_insn);
 	if (patch_perf_map((void *)((char *)img.data + prog->sh_offset),
 			   attr.insn_cnt, events_fd))
+		goto err;
+	if (patch_self_pid((void *)((char *)img.data + prog->sh_offset),
+			   attr.insn_cnt, self_pid))
+		goto err;
+	if (patch_config_map((void *)((char *)img.data + prog->sh_offset),
+			     attr.insn_cnt, config_fd))
 		goto err;
 	attr.insns = (uint64_t)((char *)img.data + prog->sh_offset);
 	attr.license = (uint64_t)((char *)img.data + license->sh_offset);
@@ -694,6 +797,19 @@ static int attach_program(struct target *target)
 	return -1;
 }
 
+static int selected(const char *sec, const char **sel, int nsel)
+{
+	int i;
+
+	if (!nsel)
+		return 1;
+	for (i = 0; i < nsel; i++)
+		if (strstr(sec, sel[i]))
+			return 1;
+
+	return 0;
+}
+
 static int can_skip(int err)
 {
 	return err == ENOENT || err == ENODEV || err == EINVAL ||
@@ -724,27 +840,59 @@ static void detach_all(void)
 		close_target(&targets[i]);
 	close_readers();
 	close_fd(&events_fd);
+	close_fd(&config_fd);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	struct filter filter;
+	const char **sel;
+	int nsel = 0;
 	size_t i;
 	int ret = 0;
 	int attached = 0;
 	int skipped = 0;
+	int a;
+
+	memset(&filter, 0, sizeof(filter));
+	sel = calloc(argc, sizeof(*sel));
+	if (!sel)
+		return 1;
+	for (a = 1; a < argc; a++) {
+		if (!strcmp(argv[a], "-p") && a + 1 < argc)
+			filter.pid = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-n") && a + 1 < argc) {
+			strncpy(filter.comm, argv[++a], sizeof(filter.comm) - 1);
+			filter.have_comm = 1;
+		} else
+			sel[nsel++] = argv[a];
+	}
+
+	self_pid = getpid();
 
 	events_fd = create_perf_map();
 	if (events_fd < 0) {
 		die_errno("events map");
+		free(sel);
+		return 1;
+	}
+	config_fd = create_filter_map();
+	if (config_fd < 0 || set_filter(config_fd, &filter)) {
+		die_errno("filter map");
+		detach_all();
+		free(sel);
 		return 1;
 	}
 	if (open_perf_readers()) {
 		die_errno("perf readers");
 		detach_all();
+		free(sel);
 		return 1;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(targets); i++) {
+		if (!selected(targets[i].sec, sel, nsel))
+			continue;
 		if (attach_program(&targets[i])) {
 			if (can_skip(errno)) {
 				fprintf(stderr, "skip %s: %s\n", targets[i].sec,
@@ -760,6 +908,7 @@ int main(void)
 		attached++;
 		printf("attached %s\n", targets[i].sec);
 	}
+	free(sel);
 	if (!attached) {
 		fprintf(stderr, "no tracing programs attached\n");
 		detach_all();

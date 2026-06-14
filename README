@@ -44,6 +44,14 @@ The asm-ebpf loader loads and attaches the assembled programs:
 It keeps running until interrupted.  It needs the usual privileges for loading
 eBPF programs and opening tracing events.
 
+The loader filters out its own events.  Trailing names attach only the matching
+hooks; -p limits output to one pid and -n to one comm:
+
+        su -c './asm-ebpf exec open'
+        su -c './asm-ebpf -n bash -p 1234'
+
+The pid and comm filters run inside the eBPF programs through a config map.
+
 
 TOOLCHAIN
 ---------
