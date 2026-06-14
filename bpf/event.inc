@@ -15,10 +15,10 @@
 	mov %r2, 16
 	call 16
 	mov %r1, 0
-	stxw [%r10+-176], %r1
+	stxw [%r10+-184], %r1
 	lddw %r1, 0
 	mov %r2, %r10
-	add %r2, -176
+	add %r2, -184
 	call 1
 	jeq %r0, 0, 3f
 	ldxw %r1, [%r0+0]
@@ -41,10 +41,12 @@
 	exit
 3:
 	mov %r1, 0
-	stxdw [%r10+-168], %r1
+	stxdw [%r10+-176], %r1
 	mov %r1, \kind
-	stxw [%r10+-168], %r1
-	stxdw [%r10+-160], %r7
+	stxw [%r10+-176], %r1
+	stxdw [%r10+-168], %r7
+	call 5
+	stxdw [%r10+-160], %r0
 	mov %r1, 0
 	stxdw [%r10+-152], %r1
 	.endm
@@ -54,7 +56,7 @@
 	lddw %r2, 0
 	mov32 %r3, 0xffffffff
 	mov %r4, %r10
-	add %r4, -168
+	add %r4, -176
 	mov %r5, \size
 	call 25
 	mov %r0, 0
@@ -63,14 +65,14 @@
 
 	.macro emit_event kind
 	event_head \kind
-	event_out 40
+	event_out 48
 	.endm
 
 	.macro emit_aux kind, off
 	event_head \kind
 	ldxdw %r1, [%r6+\off]
 	stxdw [%r10+-152], %r1
-	event_out 40
+	event_out 48
 	.endm
 
 	.macro emit_str kind, off
@@ -80,5 +82,5 @@
 	add %r1, -128
 	mov %r2, 128
 	call 114
-	event_out 168
+	event_out 176
 	.endm

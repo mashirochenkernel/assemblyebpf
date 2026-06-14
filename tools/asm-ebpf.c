@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <arpa/inet.h>
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
 #include <linux/unistd.h>
@@ -37,6 +37,7 @@ struct event {
 	uint32_t kind;
 	uint32_t pad;
 	uint64_t pid_tgid;
+	uint64_t ts;
 	uint64_t aux;
 	char comm[16];
 	char arg[128];
@@ -368,14 +369,21 @@ err:
 	return -1;
 }
 
+static uint64_t start_ts;
+
 static void print_event(const struct event *event, int has_arg)
 {
 	const struct evdesc *desc = NULL;
+	double rel;
 
 	if (event->kind < ARRAY_SIZE(evdescs))
 		desc = &evdescs[event->kind];
 
-	printf("%-6s pid=%llu tid=%llu comm=%.*s",
+	if (!start_ts || event->ts < start_ts)
+		start_ts = event->ts;
+	rel = (event->ts - start_ts) / 1e9;
+
+	printf("%-12.6f %-6s pid=%llu tid=%llu comm=%.*s", rel,
 	       desc && desc->name ? desc->name : "unknown",
 	       (unsigned long long)(event->pid_tgid >> 32),
 	       (unsigned long long)(event->pid_tgid & 0xffffffff),
@@ -843,6 +851,16 @@ static void detach_all(void)
 	close_fd(&config_fd);
 }
 
+static void usage(const char *prog)
+{
+	fprintf(stderr,
+		"usage: %s [-p pid] [-n comm] [name ...]\n"
+		"  -p pid    only events from this thread group\n"
+		"  -n comm   only events from this command\n"
+		"  name ...  attach only hooks whose section matches\n",
+		prog);
+}
+
 int main(int argc, char **argv)
 {
 	struct filter filter;
@@ -859,7 +877,11 @@ int main(int argc, char **argv)
 	if (!sel)
 		return 1;
 	for (a = 1; a < argc; a++) {
-		if (!strcmp(argv[a], "-p") && a + 1 < argc)
+		if (!strcmp(argv[a], "-h") || !strcmp(argv[a], "--help")) {
+			usage(argv[0]);
+			free(sel);
+			return 0;
+		} else if (!strcmp(argv[a], "-p") && a + 1 < argc)
 			filter.pid = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-n") && a + 1 < argc) {
 			strncpy(filter.comm, argv[++a], sizeof(filter.comm) - 1);
@@ -903,6 +925,7 @@ int main(int argc, char **argv)
 			}
 			die_errno(targets[i].sec);
 			detach_all();
+			free(sel);
 			return 1;
 		}
 		attached++;

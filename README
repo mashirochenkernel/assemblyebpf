@@ -44,6 +44,10 @@ The asm-ebpf loader loads and attaches the assembled programs:
 It keeps running until interrupted.  It needs the usual privileges for loading
 eBPF programs and opening tracing events.
 
+Each line starts with seconds since the first event, then the event kind, the
+pid and tid, the command, and an argument: a path, a file descriptor, a signal,
+a mapping length, or the tcp_connect destination as addr:port.
+
 The loader filters out its own events.  Trailing names attach only the matching
 hooks; -p limits output to one pid and -n to one comm:
 
@@ -51,6 +55,7 @@ hooks; -p limits output to one pid and -n to one comm:
         su -c './asm-ebpf -n bash -p 1234'
 
 The pid and comm filters run inside the eBPF programs through a config map.
+Run with -h for the full option list.
 
 
 TOOLCHAIN
