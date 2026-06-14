@@ -27,9 +27,9 @@
 #define LOG_SIZE	65536
 #define PERF_PAGES	8
 #define TP(obj, name) \
-	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, -1, -1 }
+	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, NULL, 0, -1 }
 #define KP(obj, group, name) \
-	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, -1, -1 }
+	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, NULL, 0, -1 }
 
 struct event {
 	uint32_t kind;
@@ -52,7 +52,8 @@ struct target {
 	enum bpf_prog_type type;
 	const char *event;
 	const char *kgroup;
-	int perf_fd;
+	int *perf_fds;
+	int nr_perf_fds;
 	int prog_fd;
 };
 
@@ -252,6 +253,7 @@ static int open_perf_readers(void)
 		attr.size = sizeof(attr);
 		attr.config = PERF_COUNT_SW_BPF_OUTPUT;
 		attr.sample_type = PERF_SAMPLE_RAW;
+		attr.sample_period = 1;
 		attr.wakeup_events = 1;
 
 		readers[cpu].fd = sys_perf_event_open(&attr, -1, cpu, -1,
@@ -355,15 +357,14 @@ static int event_loop(void)
 	}
 
 	for (;;) {
-		if (poll(fds, nr_readers, -1) < 0) {
+		if (poll(fds, nr_readers, 1000) < 0) {
 			if (errno == EINTR)
 				break;
 			free(fds);
 			return -1;
 		}
 		for (i = 0; i < nr_readers; i++)
-			if (fds[i].revents & POLLIN)
-				read_one(&readers[i]);
+			read_one(&readers[i]);
 	}
 
 	free(fds);
@@ -534,7 +535,7 @@ static int attach_event(struct target *target, const char *event)
 {
 	char path[256];
 	struct perf_event_attr attr;
-	int id, fd;
+	int cpu, id, ncpu;
 
 	snprintf(path, sizeof(path),
 		 "/sys/kernel/tracing/events/%s/id", event);
@@ -546,6 +547,16 @@ static int attach_event(struct target *target, const char *event)
 	}
 	if (id < 0)
 		return -1;
+	ncpu = sysconf(_SC_NPROCESSORS_CONF);
+	if (ncpu <= 0)
+		return -1;
+
+	target->perf_fds = calloc(ncpu, sizeof(*target->perf_fds));
+	if (!target->perf_fds)
+		return -1;
+	target->nr_perf_fds = ncpu;
+	for (cpu = 0; cpu < ncpu; cpu++)
+		target->perf_fds[cpu] = -1;
 
 	memset(&attr, 0, sizeof(attr));
 	attr.type = PERF_TYPE_TRACEPOINT;
@@ -554,19 +565,18 @@ static int attach_event(struct target *target, const char *event)
 	attr.sample_type = PERF_SAMPLE_RAW;
 	attr.wakeup_events = 1;
 
-	fd = sys_perf_event_open(&attr, -1, 0, -1, PERF_FLAG_FD_CLOEXEC);
-	if (fd < 0)
-		return -1;
-	if (ioctl(fd, PERF_EVENT_IOC_SET_BPF, target->prog_fd)) {
-		close(fd);
-		return -1;
-	}
-	if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0)) {
-		close(fd);
-		return -1;
+	for (cpu = 0; cpu < ncpu; cpu++) {
+		target->perf_fds[cpu] = sys_perf_event_open(&attr, -1, cpu, -1,
+							PERF_FLAG_FD_CLOEXEC);
+		if (target->perf_fds[cpu] < 0)
+			return -1;
+		if (ioctl(target->perf_fds[cpu], PERF_EVENT_IOC_SET_BPF,
+			  target->prog_fd))
+			return -1;
+		if (ioctl(target->perf_fds[cpu], PERF_EVENT_IOC_ENABLE, 0))
+			return -1;
 	}
 
-	target->perf_fd = fd;
 	return 0;
 }
 
@@ -631,15 +641,25 @@ static int can_skip(int err)
 	       err == EOPNOTSUPP || err == ENOSYS;
 }
 
+static void close_target(struct target *target)
+{
+	int i;
+
+	for (i = 0; i < target->nr_perf_fds; i++)
+		close_fd(&target->perf_fds[i]);
+	free(target->perf_fds);
+	target->perf_fds = NULL;
+	target->nr_perf_fds = 0;
+	close_fd(&target->prog_fd);
+	remove_kprobe(target);
+}
+
 static void detach_all(void)
 {
 	size_t i;
 
-	for (i = 0; i < ARRAY_SIZE(targets); i++) {
-		close_fd(&targets[i].perf_fd);
-		close_fd(&targets[i].prog_fd);
-		remove_kprobe(&targets[i]);
-	}
+	for (i = 0; i < ARRAY_SIZE(targets); i++)
+		close_target(&targets[i]);
 	close_readers();
 	close_fd(&events_fd);
 }
@@ -672,7 +692,7 @@ int main(void)
 			if (can_skip(errno)) {
 				fprintf(stderr, "skip %s: %s\n", targets[i].sec,
 					strerror(errno));
-				close_fd(&targets[i].prog_fd);
+				close_target(&targets[i]);
 				skipped++;
 				continue;
 			}
