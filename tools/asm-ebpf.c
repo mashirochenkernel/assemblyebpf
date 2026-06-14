@@ -26,6 +26,10 @@
 #define ARRAY_SIZE(x)	(sizeof(x) / sizeof((x)[0]))
 #define LOG_SIZE	65536
 #define PERF_PAGES	8
+#define TP(obj, name) \
+	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, -1, -1 }
+#define KP(obj, group, name) \
+	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, -1, -1 }
 
 struct event {
 	uint32_t kind;
@@ -60,28 +64,71 @@ struct perf_reader {
 };
 
 static struct target targets[] = {
-	{ "bpf/syscall.o", "tracepoint/syscalls/sys_enter_execve",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_execve", NULL, -1, -1 },
-	{ "bpf/process.o", "tracepoint/sched/sched_process_exit",
-	  BPF_PROG_TYPE_TRACEPOINT, "sched/sched_process_exit", NULL, -1, -1 },
-	{ "bpf/file.o", "tracepoint/syscalls/sys_enter_openat",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_openat", NULL, -1, -1 },
-	{ "bpf/io.o", "tracepoint/syscalls/sys_enter_read",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_read", NULL, -1, -1 },
-	{ "bpf/io.o", "tracepoint/syscalls/sys_enter_write",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_write", NULL, -1, -1 },
-	{ "bpf/io.o", "tracepoint/syscalls/sys_enter_close",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_close", NULL, -1, -1 },
-	{ "bpf/socket.o", "tracepoint/syscalls/sys_enter_connect",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_connect", NULL, -1, -1 },
-	{ "bpf/socket.o", "tracepoint/syscalls/sys_enter_accept4",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_accept4", NULL, -1, -1 },
-	{ "bpf/socket.o", "tracepoint/syscalls/sys_enter_sendto",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_sendto", NULL, -1, -1 },
-	{ "bpf/socket.o", "tracepoint/syscalls/sys_enter_recvfrom",
-	  BPF_PROG_TYPE_TRACEPOINT, "syscalls/sys_enter_recvfrom", NULL, -1, -1 },
-	{ "bpf/net.o", "kprobe/tcp_connect",
-	  BPF_PROG_TYPE_KPROBE, "tcp_connect", "asm_ebpf", -1, -1 },
+	TP("bpf/syscall.o", "syscalls/sys_enter_execve"),
+	TP("bpf/process.o", "sched/sched_process_exit"),
+	TP("bpf/file.o", "syscalls/sys_enter_openat"),
+	TP("bpf/io.o", "syscalls/sys_enter_read"),
+	TP("bpf/io.o", "syscalls/sys_enter_write"),
+	TP("bpf/io.o", "syscalls/sys_enter_close"),
+	TP("bpf/socket.o", "syscalls/sys_enter_connect"),
+	TP("bpf/socket.o", "syscalls/sys_enter_accept4"),
+	TP("bpf/socket.o", "syscalls/sys_enter_sendto"),
+	TP("bpf/socket.o", "syscalls/sys_enter_recvfrom"),
+	TP("bpf/fs.o", "syscalls/sys_enter_newfstatat"),
+	TP("bpf/fs.o", "syscalls/sys_enter_unlinkat"),
+	TP("bpf/fs.o", "syscalls/sys_enter_renameat2"),
+	TP("bpf/fs.o", "syscalls/sys_enter_mkdirat"),
+	TP("bpf/fs.o", "syscalls/sys_enter_rmdir"),
+	TP("bpf/fs.o", "syscalls/sys_enter_fchmodat"),
+	TP("bpf/fs.o", "syscalls/sys_enter_fchownat"),
+	TP("bpf/task.o", "syscalls/sys_enter_clone"),
+	TP("bpf/task.o", "syscalls/sys_enter_clone3"),
+	TP("bpf/task.o", "syscalls/sys_enter_fork"),
+	TP("bpf/task.o", "syscalls/sys_enter_vfork"),
+	TP("bpf/task.o", "syscalls/sys_enter_exit_group"),
+	TP("bpf/task.o", "syscalls/sys_enter_kill"),
+	TP("bpf/task.o", "syscalls/sys_enter_tkill"),
+	TP("bpf/task.o", "syscalls/sys_enter_tgkill"),
+	TP("bpf/task.o", "syscalls/sys_enter_prctl"),
+	TP("bpf/mm.o", "syscalls/sys_enter_mmap"),
+	TP("bpf/mm.o", "syscalls/sys_enter_mprotect"),
+	TP("bpf/mm.o", "syscalls/sys_enter_munmap"),
+	TP("bpf/mm.o", "syscalls/sys_enter_brk"),
+	KP("bpf/net.o", "asm_ebpf", "tcp_connect"),
+};
+
+static const char *event_names[] = {
+	[1] = "exec",
+	[2] = "exit",
+	[3] = "tcp",
+	[4] = "file",
+	[5] = "read",
+	[6] = "write",
+	[7] = "close",
+	[8] = "conn",
+	[9] = "accept",
+	[10] = "send",
+	[11] = "recv",
+	[12] = "stat",
+	[13] = "unlink",
+	[14] = "rename",
+	[15] = "mkdir",
+	[16] = "rmdir",
+	[17] = "chmod",
+	[18] = "chown",
+	[19] = "clone",
+	[20] = "clone3",
+	[21] = "fork",
+	[22] = "vfork",
+	[23] = "exitg",
+	[24] = "kill",
+	[25] = "tkill",
+	[26] = "tgkill",
+	[27] = "prctl",
+	[28] = "mmap",
+	[29] = "mprot",
+	[30] = "munmap",
+	[31] = "brk",
 };
 
 static int events_fd = -1;
@@ -237,28 +284,8 @@ static void print_event(const struct event *event)
 {
 	const char *kind = "unknown";
 
-	if (event->kind == 1)
-		kind = "exec";
-	else if (event->kind == 2)
-		kind = "exit";
-	else if (event->kind == 3)
-		kind = "tcp";
-	else if (event->kind == 4)
-		kind = "file";
-	else if (event->kind == 5)
-		kind = "read";
-	else if (event->kind == 6)
-		kind = "write";
-	else if (event->kind == 7)
-		kind = "close";
-	else if (event->kind == 8)
-		kind = "conn";
-	else if (event->kind == 9)
-		kind = "accept";
-	else if (event->kind == 10)
-		kind = "send";
-	else if (event->kind == 11)
-		kind = "recv";
+	if (event->kind < ARRAY_SIZE(event_names) && event_names[event->kind])
+		kind = event_names[event->kind];
 
 	printf("%-5s pid=%llu tid=%llu comm=%.*s\n", kind,
 	       (unsigned long long)(event->pid_tgid >> 32),
@@ -598,6 +625,12 @@ static int attach_program(struct target *target)
 	return -1;
 }
 
+static int can_skip(int err)
+{
+	return err == ENOENT || err == ENODEV || err == EINVAL ||
+	       err == EOPNOTSUPP || err == ENOSYS;
+}
+
 static void detach_all(void)
 {
 	size_t i;
@@ -615,6 +648,8 @@ int main(void)
 {
 	size_t i;
 	int ret = 0;
+	int attached = 0;
+	int skipped = 0;
 
 	events_fd = create_perf_map();
 	if (events_fd < 0) {
@@ -634,12 +669,27 @@ int main(void)
 			return 1;
 		}
 		if (attach_program(&targets[i])) {
+			if (can_skip(errno)) {
+				fprintf(stderr, "skip %s: %s\n", targets[i].sec,
+					strerror(errno));
+				close_fd(&targets[i].prog_fd);
+				skipped++;
+				continue;
+			}
 			die_errno(targets[i].sec);
 			detach_all();
 			return 1;
 		}
+		attached++;
 		printf("attached %s\n", targets[i].sec);
 	}
+	if (!attached) {
+		fprintf(stderr, "no tracing programs attached\n");
+		detach_all();
+		return 1;
+	}
+	if (skipped)
+		fprintf(stderr, "skipped %d unavailable hooks\n", skipped);
 
 	ret = event_loop();
 	if (ret)
