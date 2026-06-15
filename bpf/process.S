@@ -5,7 +5,7 @@
 	.section "tracepoint/sched/sched_process_exit", "ax"
 	.global trace_process_exit
 trace_process_exit:
-	emit_event 2
+	emit_exit 2
 
 	.section "license", "a"
 _license:

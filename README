@@ -57,6 +57,15 @@ hooks; -p limits output to one pid and -n to one comm:
 The pid and comm filters run inside the eBPF programs through a config map.
 Run with -h for the full option list.
 
+The eBPF programs also keep running totals in kernel maps: every program
+atomically counts its events by kind, and the read, write, sendto and recvfrom
+programs accumulate the requested byte counts.  On exit the loader prints the
+per-kind event counts and, for the I/O kinds, the byte totals.
+
+The execve program stores a start timestamp keyed by pid, and the process exit
+program looks it up to report the process lifetime as life=<ms> on the exit
+line, then drops the entry.
+
 
 TOOLCHAIN
 ---------

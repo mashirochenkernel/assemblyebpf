@@ -152,6 +152,9 @@ static const struct evdesc {
 
 static int events_fd = -1;
 static int config_fd = -1;
+static int count_fd = -1;
+static int bytes_fd = -1;
+static int start_fd = -1;
 static int self_pid;
 static struct perf_reader *readers;
 static int nr_readers;
@@ -195,6 +198,32 @@ static int create_filter_map(void)
 	return sys_bpf(BPF_MAP_CREATE, &attr);
 }
 
+static int create_stat_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_ARRAY;
+	attr.key_size = sizeof(uint32_t);
+	attr.value_size = sizeof(uint64_t);
+	attr.max_entries = ARRAY_SIZE(evdescs);
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int create_start_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_HASH;
+	attr.key_size = sizeof(uint32_t);
+	attr.value_size = sizeof(uint64_t);
+	attr.max_entries = 4096;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
 static int set_filter(int map_fd, const struct filter *filter)
 {
 	union bpf_attr attr;
@@ -209,19 +238,36 @@ static int set_filter(int map_fd, const struct filter *filter)
 	return sys_bpf(BPF_MAP_UPDATE_ELEM, &attr);
 }
 
-static int patch_perf_map(struct bpf_insn *insns, size_t cnt, int map_fd)
+static int lookup_stat(int map_fd, uint32_t key, uint64_t *value)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_fd = map_fd;
+	attr.key = (uint64_t)&key;
+	attr.value = (uint64_t)value;
+
+	return sys_bpf(BPF_MAP_LOOKUP_ELEM, &attr);
+}
+
+static int patch_map_fd(struct bpf_insn *insns, size_t cnt, int dst,
+			int sentinel, int map_fd)
 {
 	size_t i;
+	int found = 0;
 
 	for (i = 0; i + 1 < cnt; i++) {
 		if (insns[i].code == (BPF_LD | BPF_DW | BPF_IMM) &&
-		    insns[i].dst_reg == BPF_REG_2 && !insns[i].src_reg &&
-		    !insns[i].imm && !insns[i + 1].imm) {
+		    insns[i].dst_reg == dst && !insns[i].src_reg &&
+		    insns[i].imm == sentinel && !insns[i + 1].imm) {
 			insns[i].src_reg = BPF_PSEUDO_MAP_FD;
 			insns[i].imm = map_fd;
-			return 0;
+			found = 1;
 		}
 	}
+
+	if (found)
+		return 0;
 
 	errno = ENOENT;
 	return -1;
@@ -236,24 +282,6 @@ static int patch_self_pid(struct bpf_insn *insns, size_t cnt, int pid)
 		    insns[i].dst_reg == BPF_REG_1 && !insns[i].src_reg &&
 		    !insns[i].imm) {
 			insns[i].imm = pid;
-			return 0;
-		}
-	}
-
-	errno = ENOENT;
-	return -1;
-}
-
-static int patch_config_map(struct bpf_insn *insns, size_t cnt, int map_fd)
-{
-	size_t i;
-
-	for (i = 0; i + 1 < cnt; i++) {
-		if (insns[i].code == (BPF_LD | BPF_DW | BPF_IMM) &&
-		    insns[i].dst_reg == BPF_REG_1 && !insns[i].src_reg &&
-		    !insns[i].imm && !insns[i + 1].imm) {
-			insns[i].src_reg = BPF_PSEUDO_MAP_FD;
-			insns[i].imm = map_fd;
 			return 0;
 		}
 	}
@@ -398,11 +426,37 @@ static void print_event(const struct event *event, int has_arg)
 
 		printf(" %u.%u.%u.%u:%u", b[0], b[1], b[2], b[3],
 		       ntohs(dport));
+	} else if (event->kind == 2 && event->aux) {
+		printf(" life=%.3fms", event->aux / 1e6);
 	} else if (desc && desc->label) {
 		printf(" %s=%llu", desc->label,
 		       (unsigned long long)event->aux);
 	}
 	putchar('\n');
+}
+
+static void dump_counts(void)
+{
+	uint64_t total = 0;
+	size_t i;
+
+	fprintf(stderr, "\nevent counts\n");
+	for (i = 0; i < ARRAY_SIZE(evdescs); i++) {
+		uint64_t value, bytes = 0;
+
+		if (!evdescs[i].name || lookup_stat(count_fd, i, &value))
+			continue;
+		lookup_stat(bytes_fd, i, &bytes);
+		if (bytes)
+			fprintf(stderr, "%-6s %llu req=%llu\n", evdescs[i].name,
+				(unsigned long long)value,
+				(unsigned long long)bytes);
+		else
+			fprintf(stderr, "%-6s %llu\n", evdescs[i].name,
+				(unsigned long long)value);
+		total += value;
+	}
+	fprintf(stderr, "total  %llu\n", (unsigned long long)total);
 }
 
 static void read_one(struct perf_reader *reader)
@@ -599,6 +653,7 @@ static int load_program(struct target *target)
 	union bpf_attr attr;
 	Elf64_Shdr *prog, *license;
 	struct image img = { 0 };
+	struct bpf_insn *insns;
 	int fd;
 
 	if (read_file(target->obj, &img))
@@ -617,14 +672,20 @@ static int load_program(struct target *target)
 	memset(log, 0, sizeof(log));
 	attr.prog_type = target->type;
 	attr.insn_cnt = prog->sh_size / sizeof(struct bpf_insn);
-	if (patch_perf_map((void *)((char *)img.data + prog->sh_offset),
-			   attr.insn_cnt, events_fd))
+	insns = (void *)((char *)img.data + prog->sh_offset);
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_2, 0, events_fd))
 		goto err;
-	if (patch_self_pid((void *)((char *)img.data + prog->sh_offset),
-			   attr.insn_cnt, self_pid))
+	if (patch_self_pid(insns, attr.insn_cnt, self_pid))
 		goto err;
-	if (patch_config_map((void *)((char *)img.data + prog->sh_offset),
-			     attr.insn_cnt, config_fd))
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 0, config_fd))
+		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 1, count_fd))
+		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 2, bytes_fd) &&
+	    errno != ENOENT)
+		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 3, start_fd) &&
+	    errno != ENOENT)
 		goto err;
 	attr.insns = (uint64_t)((char *)img.data + prog->sh_offset);
 	attr.license = (uint64_t)((char *)img.data + license->sh_offset);
@@ -849,6 +910,9 @@ static void detach_all(void)
 	close_readers();
 	close_fd(&events_fd);
 	close_fd(&config_fd);
+	close_fd(&count_fd);
+	close_fd(&bytes_fd);
+	close_fd(&start_fd);
 }
 
 static void usage(const char *prog)
@@ -905,6 +969,15 @@ int main(int argc, char **argv)
 		free(sel);
 		return 1;
 	}
+	count_fd = create_stat_map();
+	bytes_fd = create_stat_map();
+	start_fd = create_start_map();
+	if (count_fd < 0 || bytes_fd < 0 || start_fd < 0) {
+		die_errno("stat map");
+		detach_all();
+		free(sel);
+		return 1;
+	}
 	if (open_perf_readers()) {
 		die_errno("perf readers");
 		detach_all();
@@ -943,6 +1016,7 @@ int main(int argc, char **argv)
 	ret = event_loop();
 	if (ret)
 		die_errno("poll");
+	dump_counts();
 	detach_all();
 	return ret ? 1 : 0;
 }

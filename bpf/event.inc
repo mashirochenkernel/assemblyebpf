@@ -40,6 +40,16 @@
 	mov %r0, 0
 	exit
 3:
+	mov %r1, \kind
+	stxw [%r10+-184], %r1
+	lddw %r1, 1
+	mov %r2, %r10
+	add %r2, -184
+	call 1
+	jeq %r0, 0, 5f
+	mov %r2, 1
+	xadddw [%r0+0], %r2
+5:
 	mov %r1, 0
 	stxdw [%r10+-176], %r1
 	mov %r1, \kind
@@ -75,6 +85,23 @@
 	event_out 48
 	.endm
 
+	.macro emit_io kind, fdoff, lenoff
+	event_head \kind
+	ldxdw %r1, [%r6+\fdoff]
+	stxdw [%r10+-152], %r1
+	mov %r1, \kind
+	stxw [%r10+-184], %r1
+	lddw %r1, 2
+	mov %r2, %r10
+	add %r2, -184
+	call 1
+	jeq %r0, 0, 6f
+	ldxdw %r2, [%r6+\lenoff]
+	xadddw [%r0+0], %r2
+6:
+	event_out 48
+	.endm
+
 	.macro emit_str kind, off
 	event_head \kind
 	ldxdw %r3, [%r6+\off]
@@ -83,4 +110,48 @@
 	mov %r2, 128
 	call 114
 	event_out 176
+	.endm
+
+	.macro emit_exec kind, off
+	event_head \kind
+	mov %r1, %r7
+	rsh %r1, 32
+	stxw [%r10+-184], %r1
+	ldxdw %r1, [%r10+-160]
+	stxdw [%r10+-192], %r1
+	lddw %r1, 3
+	mov %r2, %r10
+	add %r2, -184
+	mov %r3, %r10
+	add %r3, -192
+	mov %r4, 0
+	call 2
+	ldxdw %r3, [%r6+\off]
+	mov %r1, %r10
+	add %r1, -128
+	mov %r2, 128
+	call 114
+	event_out 176
+	.endm
+
+	.macro emit_exit kind
+	event_head \kind
+	mov %r1, %r7
+	rsh %r1, 32
+	stxw [%r10+-184], %r1
+	lddw %r1, 3
+	mov %r2, %r10
+	add %r2, -184
+	call 1
+	jeq %r0, 0, 8f
+	ldxdw %r8, [%r0+0]
+	ldxdw %r1, [%r10+-160]
+	sub %r1, %r8
+	stxdw [%r10+-152], %r1
+	lddw %r1, 3
+	mov %r2, %r10
+	add %r2, -184
+	call 3
+8:
+	event_out 48
 	.endm
