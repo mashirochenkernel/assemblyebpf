@@ -28,10 +28,13 @@
 #define ARRAY_SIZE(x)	(sizeof(x) / sizeof((x)[0]))
 #define LOG_SIZE	65536
 #define PERF_PAGES	8
+#define HIST_SLOTS	64
 #define TP(obj, name) \
-	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, NULL, NULL, 0 }
+	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, 1, NULL, NULL, 0 }
 #define KP(obj, group, name) \
-	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, NULL, NULL, 0 }
+	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, 1, NULL, NULL, 0 }
+#define LAT(obj, name) \
+	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, 0, NULL, NULL, 0 }
 
 struct event {
 	uint32_t kind;
@@ -65,6 +68,7 @@ struct target {
 	enum bpf_prog_type type;
 	const char *event;
 	const char *kgroup;
+	int head;
 	int *perf_fds;
 	int *prog_fds;
 	int nr_fds;
@@ -111,6 +115,12 @@ static struct target targets[] = {
 	TP("bpf/mm.o", "syscalls/sys_enter_munmap"),
 	TP("bpf/mm.o", "syscalls/sys_enter_brk"),
 	KP("bpf/net.o", "asm_ebpf", "tcp_connect"),
+	KP("bpf/kprobe.o", "asm_ebpf", "tcp_close"),
+	KP("bpf/kprobe.o", "asm_ebpf", "vfs_open"),
+	KP("bpf/kprobe.o", "asm_ebpf", "vfs_unlink"),
+	KP("bpf/kprobe.o", "asm_ebpf", "tcp_conn_request"),
+	LAT("bpf/lat.o", "syscalls/sys_enter_read"),
+	LAT("bpf/lat.o", "syscalls/sys_exit_read"),
 };
 
 static const struct evdesc {
@@ -148,6 +158,10 @@ static const struct evdesc {
 	[29] = { "mprot",  "len" },
 	[30] = { "munmap", "len" },
 	[31] = { "brk",    "addr" },
+	[32] = { "tcpclose", NULL },
+	[33] = { "vfsopen",  NULL },
+	[34] = { "vfsunlink", NULL },
+	[35] = { "connreq", NULL },
 };
 
 static int events_fd = -1;
@@ -155,6 +169,9 @@ static int config_fd = -1;
 static int count_fd = -1;
 static int bytes_fd = -1;
 static int start_fd = -1;
+static int hist_fd = -1;
+static int startlat_fd = -1;
+static int pidstat_fd = -1;
 static int self_pid;
 static struct perf_reader *readers;
 static int nr_readers;
@@ -220,6 +237,45 @@ static int create_start_map(void)
 	attr.key_size = sizeof(uint32_t);
 	attr.value_size = sizeof(uint64_t);
 	attr.max_entries = 4096;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int create_hist_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_ARRAY;
+	attr.key_size = sizeof(uint32_t);
+	attr.value_size = sizeof(uint64_t);
+	attr.max_entries = HIST_SLOTS;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int create_startlat_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_HASH;
+	attr.key_size = sizeof(uint64_t);
+	attr.value_size = sizeof(uint64_t);
+	attr.max_entries = 4096;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int create_pidstat_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_HASH;
+	attr.key_size = sizeof(uint32_t);
+	attr.value_size = sizeof(uint64_t);
+	attr.max_entries = 16384;
 
 	return sys_bpf(BPF_MAP_CREATE, &attr);
 }
@@ -411,21 +467,28 @@ static void print_event(const struct event *event, int has_arg)
 		start_ts = event->ts;
 	rel = (event->ts - start_ts) / 1e9;
 
-	printf("%-12.6f %-6s pid=%llu tid=%llu comm=%.*s", rel,
+	printf("%-12.6f %-9s pid=%llu tid=%llu comm=%.*s", rel,
 	       desc && desc->name ? desc->name : "unknown",
 	       (unsigned long long)(event->pid_tgid >> 32),
 	       (unsigned long long)(event->pid_tgid & 0xffffffff),
 	       (int)sizeof(event->comm), event->comm);
 
-	if (has_arg) {
-		printf(" %.*s", (int)sizeof(event->arg), event->arg);
-	} else if (event->kind == 3) {
+	if (event->kind == 3) {
 		uint32_t daddr = event->aux & 0xffffffff;
 		uint16_t dport = (event->aux >> 32) & 0xffff;
-		const unsigned char *b = (const unsigned char *)&daddr;
+		uint32_t saddr;
+		uint16_t sport;
+		const unsigned char *d = (const unsigned char *)&daddr;
+		const unsigned char *s;
 
-		printf(" %u.%u.%u.%u:%u", b[0], b[1], b[2], b[3],
-		       ntohs(dport));
+		memcpy(&saddr, event->arg, 4);
+		memcpy(&sport, event->arg + 4, 2);
+		s = (const unsigned char *)&saddr;
+		printf(" %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
+		       s[0], s[1], s[2], s[3], sport,
+		       d[0], d[1], d[2], d[3], ntohs(dport));
+	} else if (has_arg) {
+		printf(" %.*s", (int)sizeof(event->arg), event->arg);
 	} else if (event->kind == 2 && event->aux) {
 		printf(" life=%.3fms", event->aux / 1e6);
 	} else if (desc && desc->label) {
@@ -448,15 +511,95 @@ static void dump_counts(void)
 			continue;
 		lookup_stat(bytes_fd, i, &bytes);
 		if (bytes)
-			fprintf(stderr, "%-6s %llu req=%llu\n", evdescs[i].name,
+			fprintf(stderr, "%-9s %llu req=%llu\n", evdescs[i].name,
 				(unsigned long long)value,
 				(unsigned long long)bytes);
 		else
-			fprintf(stderr, "%-6s %llu\n", evdescs[i].name,
+			fprintf(stderr, "%-9s %llu\n", evdescs[i].name,
 				(unsigned long long)value);
 		total += value;
 	}
 	fprintf(stderr, "total  %llu\n", (unsigned long long)total);
+}
+
+static void dump_hist(void)
+{
+	uint64_t slots[HIST_SLOTS] = { 0 };
+	uint64_t max = 0;
+	int i, hi = 0;
+
+	for (i = 0; i < HIST_SLOTS; i++) {
+		if (lookup_stat(hist_fd, i, &slots[i]))
+			continue;
+		if (slots[i]) {
+			hi = i;
+			if (slots[i] > max)
+				max = slots[i];
+		}
+	}
+	if (!max)
+		return;
+
+	fprintf(stderr, "\nread latency (ns)\n");
+	for (i = 0; i <= hi; i++) {
+		uint64_t lo = i ? 1ULL << i : 0;
+		uint64_t up = i < 63 ? (1ULL << (i + 1)) - 1 : ~0ULL;
+		int bar = (int)(slots[i] * 40 / max);
+		int j;
+
+		fprintf(stderr, "%12llu -> %-20llu |",
+			(unsigned long long)lo, (unsigned long long)up);
+		for (j = 0; j < bar; j++)
+			putc('*', stderr);
+		fprintf(stderr, " %llu\n", (unsigned long long)slots[i]);
+	}
+}
+
+static int next_key(int map_fd, const uint32_t *key, uint32_t *next)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_fd = map_fd;
+	attr.key = (uint64_t)key;
+	attr.next_key = (uint64_t)next;
+
+	return sys_bpf(BPF_MAP_GET_NEXT_KEY, &attr);
+}
+
+static void dump_pidstat(void)
+{
+	uint32_t key = 0, next;
+	uint32_t top_pid[10] = { 0 };
+	uint64_t top_val[10] = { 0 };
+	int have = 0, i, j;
+
+	while (!next_key(pidstat_fd, have ? &key : NULL, &next)) {
+		uint64_t value = 0;
+
+		key = next;
+		have = 1;
+		if (lookup_stat(pidstat_fd, key, &value))
+			continue;
+		for (i = 0; i < 10; i++) {
+			if (value > top_val[i]) {
+				for (j = 9; j > i; j--) {
+					top_val[j] = top_val[j - 1];
+					top_pid[j] = top_pid[j - 1];
+				}
+				top_val[i] = value;
+				top_pid[i] = key;
+				break;
+			}
+		}
+	}
+
+	if (!top_val[0])
+		return;
+	fprintf(stderr, "\ntop pids by events\n");
+	for (i = 0; i < 10 && top_val[i]; i++)
+		fprintf(stderr, "pid=%-8u %llu\n", top_pid[i],
+			(unsigned long long)top_val[i]);
 }
 
 static void read_one(struct perf_reader *reader)
@@ -673,19 +816,32 @@ static int load_program(struct target *target)
 	attr.prog_type = target->type;
 	attr.insn_cnt = prog->sh_size / sizeof(struct bpf_insn);
 	insns = (void *)((char *)img.data + prog->sh_offset);
-	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_2, 0, events_fd))
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_2, 0, events_fd) &&
+	    (target->head || errno != ENOENT))
 		goto err;
-	if (patch_self_pid(insns, attr.insn_cnt, self_pid))
+	if (patch_self_pid(insns, attr.insn_cnt, self_pid) &&
+	    (target->head || errno != ENOENT))
 		goto err;
-	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 0, config_fd))
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 0, config_fd) &&
+	    (target->head || errno != ENOENT))
 		goto err;
-	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 1, count_fd))
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 1, count_fd) &&
+	    (target->head || errno != ENOENT))
 		goto err;
 	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 2, bytes_fd) &&
 	    errno != ENOENT)
 		goto err;
 	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 3, start_fd) &&
 	    errno != ENOENT)
+		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 4, hist_fd) &&
+	    errno != ENOENT)
+		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 5, startlat_fd) &&
+	    errno != ENOENT)
+		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 6, pidstat_fd) &&
+	    (target->head || errno != ENOENT))
 		goto err;
 	attr.insns = (uint64_t)((char *)img.data + prog->sh_offset);
 	attr.license = (uint64_t)((char *)img.data + license->sh_offset);
@@ -913,6 +1069,9 @@ static void detach_all(void)
 	close_fd(&count_fd);
 	close_fd(&bytes_fd);
 	close_fd(&start_fd);
+	close_fd(&hist_fd);
+	close_fd(&startlat_fd);
+	close_fd(&pidstat_fd);
 }
 
 static void usage(const char *prog)
@@ -972,7 +1131,11 @@ int main(int argc, char **argv)
 	count_fd = create_stat_map();
 	bytes_fd = create_stat_map();
 	start_fd = create_start_map();
-	if (count_fd < 0 || bytes_fd < 0 || start_fd < 0) {
+	hist_fd = create_hist_map();
+	startlat_fd = create_startlat_map();
+	pidstat_fd = create_pidstat_map();
+	if (count_fd < 0 || bytes_fd < 0 || start_fd < 0 ||
+	    hist_fd < 0 || startlat_fd < 0 || pidstat_fd < 0) {
 		die_errno("stat map");
 		detach_all();
 		free(sel);
@@ -1017,6 +1180,8 @@ int main(int argc, char **argv)
 	if (ret)
 		die_errno("poll");
 	dump_counts();
+	dump_hist();
+	dump_pidstat();
 	detach_all();
 	return ret ? 1 : 0;
 }

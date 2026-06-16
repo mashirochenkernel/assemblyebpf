@@ -46,7 +46,11 @@ eBPF programs and opening tracing events.
 
 Each line starts with seconds since the first event, then the event kind, the
 pid and tid, the command, and an argument: a path, a file descriptor, a signal,
-a mapping length, or the tcp_connect destination as addr:port.
+a mapping length, or the tcp_connect endpoints as saddr:sport -> daddr:dport.
+
+Besides the syscall tracepoints the tree attaches kernel probes on tcp_connect,
+tcp_close, vfs_open, vfs_unlink and tcp_conn_request.  Probes on symbols the
+running kernel does not export are skipped.
 
 The loader filters out its own events.  Trailing names attach only the matching
 hooks; -p limits output to one pid and -n to one comm:
@@ -59,12 +63,18 @@ Run with -h for the full option list.
 
 The eBPF programs also keep running totals in kernel maps: every program
 atomically counts its events by kind, and the read, write, sendto and recvfrom
-programs accumulate the requested byte counts.  On exit the loader prints the
-per-kind event counts and, for the I/O kinds, the byte totals.
+programs accumulate the requested byte counts.  Each program also counts its
+events per pid.  On exit the loader prints the per-kind event counts, the byte
+totals for the I/O kinds, and the busiest pids.
 
 The execve program stores a start timestamp keyed by pid, and the process exit
 program looks it up to report the process lifetime as life=<ms> on the exit
 line, then drops the entry.
+
+A separate program pair times read syscalls: the enter program stores a
+timestamp keyed by thread, the exit program computes the delta, buckets it by
+power of two entirely in assembly, and accumulates a histogram map.  The loader
+prints the latency histogram on exit.
 
 
 TOOLCHAIN

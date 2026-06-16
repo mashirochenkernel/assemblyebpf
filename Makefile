@@ -13,9 +13,12 @@ CFLAGS	?= -O2 -Wall -Wextra -Werror
 
 SRCS	:= $(wildcard bpf/*.S)
 PROGS	:= $(SRCS:.S=.o)
+INCS	:= $(wildcard bpf/*.inc)
 HOSTPROGS := asm-ebpf
 
 all: $(PROGS) $(HOSTPROGS)
+
+$(PROGS): $(INCS)
 
 ifeq ($(LLVM),1)
 %.o: %.S

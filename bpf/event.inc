@@ -50,6 +50,28 @@
 	mov %r2, 1
 	xadddw [%r0+0], %r2
 5:
+	mov %r1, %r7
+	rsh %r1, 32
+	stxw [%r10+-184], %r1
+	lddw %r1, 6
+	mov %r2, %r10
+	add %r2, -184
+	call 1
+	jne %r0, 0, 7f
+	mov %r1, 1
+	stxdw [%r10+-192], %r1
+	lddw %r1, 6
+	mov %r2, %r10
+	add %r2, -184
+	mov %r3, %r10
+	add %r3, -192
+	mov %r4, 0
+	call 2
+	ja 9f
+7:
+	mov %r2, 1
+	xadddw [%r0+0], %r2
+9:
 	mov %r1, 0
 	stxdw [%r10+-176], %r1
 	mov %r1, \kind
