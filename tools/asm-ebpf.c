@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -20,6 +21,14 @@
 #include <unistd.h>
 
 #include <elf.h>
+
+int tui_init(void);
+void tui_fini(void);
+int tui_winsize(unsigned short *rows, unsigned short *cols);
+int tui_readkey(void);
+void tui_render(const char *buf, unsigned long len);
+unsigned long tui_u64(char *dst, unsigned long val);
+unsigned long tui_human(char *dst, unsigned long val);
 
 #ifndef PERF_FLAG_FD_CLOEXEC
 #define PERF_FLAG_FD_CLOEXEC	(1UL << 3)
@@ -178,6 +187,14 @@ static int nr_readers;
 static int reported_bad_sample;
 static int reported_lost;
 static int reported_record;
+static volatile sig_atomic_t stop_flag;
+static int tui_on;
+
+static void on_signal(int sig)
+{
+	(void)sig;
+	stop_flag = 1;
+}
 
 static int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr)
 {
@@ -649,10 +666,11 @@ static void read_one(struct perf_reader *reader)
 			memcpy(&raw_len, buf + sizeof(*hdr), sizeof(raw_len));
 			if (raw_len >= EVENT_HEAD &&
 			    raw_len <= sizeof(struct event) &&
-			    sizeof(*hdr) + 4 + raw_len <= len)
-				print_event((void *)(buf + sizeof(*hdr) + 4),
-					    raw_len >= sizeof(struct event));
-			else if (!reported_bad_sample) {
+			    sizeof(*hdr) + 4 + raw_len <= len) {
+				if (!tui_on)
+					print_event((void *)(buf + sizeof(*hdr) + 4),
+						    raw_len >= sizeof(struct event));
+			} else if (!reported_bad_sample) {
 				fprintf(stderr, "bad sample size %u record %zu\n",
 					raw_len, len);
 				reported_bad_sample = 1;
@@ -671,6 +689,223 @@ static void read_one(struct perf_reader *reader)
 		reader->tail += hdr->size;
 	}
 	meta->data_tail = reader->tail;
+}
+
+struct pidrow {
+	uint32_t pid;
+	uint64_t total;
+	uint64_t rate;
+};
+
+static struct pidrow rows_cur[4096];
+static struct pidrow rows_prev[4096];
+static int nr_prev;
+
+static int read_comm(uint32_t pid, char *buf, int len)
+{
+	char path[64];
+	int fd;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "/proc/%u/comm", pid);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, len - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	if (buf[n - 1] == '\n')
+		n--;
+	buf[n] = '\0';
+	return 0;
+}
+
+static uint64_t prev_total(uint32_t pid)
+{
+	int i;
+
+	for (i = 0; i < nr_prev; i++)
+		if (rows_prev[i].pid == pid)
+			return rows_prev[i].total;
+	return 0;
+}
+
+static int by_rate(const void *a, const void *b)
+{
+	const struct pidrow *x = a, *y = b;
+
+	if (y->rate != x->rate)
+		return y->rate > x->rate ? 1 : -1;
+	return 0;
+}
+
+static int snapshot_pids(void)
+{
+	uint32_t key = 0, next;
+	int have = 0, n = 0;
+
+	while (n < (int)ARRAY_SIZE(rows_cur) &&
+	       !next_key(pidstat_fd, have ? &key : NULL, &next)) {
+		uint64_t value = 0;
+
+		key = next;
+		have = 1;
+		if (lookup_stat(pidstat_fd, key, &value))
+			continue;
+		rows_cur[n].pid = key;
+		rows_cur[n].total = value;
+		rows_cur[n].rate = value - prev_total(key);
+		n++;
+	}
+	return n;
+}
+
+static char *append(char *p, const char *s)
+{
+	while (*s)
+		*p++ = *s++;
+	return p;
+}
+
+static char *append_pad(char *p, const char *s, int width)
+{
+	int n = 0;
+
+	while (*s && n < width) {
+		*p++ = *s++;
+		n++;
+	}
+	while (n < width) {
+		*p++ = ' ';
+		n++;
+	}
+	return p;
+}
+
+static void render_top(int rows, const char *filter)
+{
+	static char buf[65536];
+	char comm[32];
+	char *p = buf;
+	int n, i, shown = 0, limit;
+
+	n = snapshot_pids();
+	qsort(rows_cur, n, sizeof(rows_cur[0]), by_rate);
+
+	p = append(p, "\033[K asm-ebpf  top pids");
+	if (filter[0]) {
+		p = append(p, "  filter=");
+		p = append(p, filter);
+	}
+	p = append(p, "   q:quit p:pause /:filter 1/2/3:view\r\n");
+	p = append(p, "\033[K ");
+	p = append_pad(p, "pid", 10);
+	p = append_pad(p, "comm", 18);
+	p = append_pad(p, "events", 12);
+	p = append(p, "evt/s\r\n");
+
+	limit = rows - 4;
+	if (limit > 512)
+		limit = 512;
+	for (i = 0; i < n && shown < limit; i++) {
+		char num[32];
+
+		if (read_comm(rows_cur[i].pid, comm, sizeof(comm)))
+			strcpy(comm, "?");
+		if (filter[0] && !strstr(comm, filter))
+			continue;
+		p = append(p, "\033[K ");
+		num[tui_u64(num, rows_cur[i].pid)] = '\0';
+		p = append_pad(p, num, 10);
+		p = append_pad(p, comm, 18);
+		num[tui_u64(num, rows_cur[i].total)] = '\0';
+		p = append_pad(p, num, 12);
+		num[tui_u64(num, rows_cur[i].rate)] = '\0';
+		p = append(p, num);
+		p = append(p, "\r\n");
+		shown++;
+	}
+	p = append(p, "\033[J");
+
+	tui_render(buf, p - buf);
+
+	memcpy(rows_prev, rows_cur, n * sizeof(rows_cur[0]));
+	nr_prev = n;
+}
+
+static int tui_loop(void)
+{
+	struct pollfd *fds;
+	char filter[32] = { 0 };
+	int filt_mode = 0, paused = 0;
+	unsigned short trows = 24, tcols = 80;
+	int i;
+
+	if (tui_init())
+		return -1;
+
+	fds = calloc(nr_readers + 1, sizeof(*fds));
+	if (!fds) {
+		tui_fini();
+		return -1;
+	}
+	for (i = 0; i < nr_readers; i++) {
+		fds[i].fd = readers[i].fd;
+		fds[i].events = POLLIN;
+	}
+	fds[nr_readers].fd = 0;
+	fds[nr_readers].events = POLLIN;
+
+	(void)tcols;
+	while (!stop_flag) {
+		int key;
+
+		if (poll(fds, nr_readers + 1, 500) < 0) {
+			if (errno == EINTR)
+				break;
+			break;
+		}
+		for (i = 0; i < nr_readers; i++)
+			read_one(&readers[i]);
+
+		while ((key = tui_readkey()) >= 0) {
+			if (filt_mode) {
+				int l = strlen(filter);
+
+				if (key == '\r' || key == '\n')
+					filt_mode = 0;
+				else if (key == 127 || key == 8) {
+					if (l)
+						filter[l - 1] = '\0';
+				} else if (key == 27) {
+					filt_mode = 0;
+					filter[0] = '\0';
+				} else if (l < (int)sizeof(filter) - 1) {
+					filter[l] = key;
+					filter[l + 1] = '\0';
+				}
+				continue;
+			}
+			if (key == 'q')
+				stop_flag = 1;
+			else if (key == 'p')
+				paused = !paused;
+			else if (key == '/')
+				filt_mode = 1;
+		}
+
+		if (!paused) {
+			tui_winsize(&trows, &tcols);
+			if (trows < 6)
+				trows = 6;
+			render_top(trows, filter);
+		}
+	}
+
+	tui_fini();
+	free(fds);
+	return 0;
 }
 
 static int event_loop(void)
@@ -1077,9 +1312,10 @@ static void detach_all(void)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"usage: %s [-p pid] [-n comm] [name ...]\n"
+		"usage: %s [-p pid] [-n comm] [--no-tui] [name ...]\n"
 		"  -p pid    only events from this thread group\n"
 		"  -n comm   only events from this command\n"
+		"  --no-tui  stream events instead of the live view\n"
 		"  name ...  attach only hooks whose section matches\n",
 		prog);
 }
@@ -1094,6 +1330,7 @@ int main(int argc, char **argv)
 	int attached = 0;
 	int skipped = 0;
 	int a;
+	int no_tui = 0;
 
 	memset(&filter, 0, sizeof(filter));
 	sel = calloc(argc, sizeof(*sel));
@@ -1104,7 +1341,9 @@ int main(int argc, char **argv)
 			usage(argv[0]);
 			free(sel);
 			return 0;
-		} else if (!strcmp(argv[a], "-p") && a + 1 < argc)
+		} else if (!strcmp(argv[a], "--no-tui"))
+			no_tui = 1;
+		else if (!strcmp(argv[a], "-p") && a + 1 < argc)
 			filter.pid = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-n") && a + 1 < argc) {
 			strncpy(filter.comm, argv[++a], sizeof(filter.comm) - 1);
@@ -1114,6 +1353,7 @@ int main(int argc, char **argv)
 	}
 
 	self_pid = getpid();
+	tui_on = !no_tui && isatty(1);
 
 	events_fd = create_perf_map();
 	if (events_fd < 0) {
@@ -1165,7 +1405,8 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		attached++;
-		printf("attached %s\n", targets[i].sec);
+		if (!tui_on)
+			printf("attached %s\n", targets[i].sec);
 	}
 	free(sel);
 	if (!attached) {
@@ -1176,12 +1417,23 @@ int main(int argc, char **argv)
 	if (skipped)
 		fprintf(stderr, "skipped %d unavailable hooks\n", skipped);
 
-	ret = event_loop();
-	if (ret)
-		die_errno("poll");
-	dump_counts();
-	dump_hist();
-	dump_pidstat();
+	if (tui_on) {
+		struct sigaction sa = { 0 };
+
+		sa.sa_handler = on_signal;
+		sigaction(SIGINT, &sa, NULL);
+		sigaction(SIGTERM, &sa, NULL);
+		ret = tui_loop();
+		if (ret)
+			fprintf(stderr, "tui init failed; need a terminal\n");
+	} else {
+		ret = event_loop();
+		if (ret)
+			die_errno("poll");
+		dump_counts();
+		dump_hist();
+		dump_pidstat();
+	}
 	detach_all();
 	return ret ? 1 : 0;
 }

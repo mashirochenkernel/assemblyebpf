@@ -44,6 +44,12 @@ The asm-ebpf loader loads and attaches the assembled programs:
 It keeps running until interrupted.  It needs the usual privileges for loading
 eBPF programs and opening tracing events.
 
+On a terminal the loader shows a live full-screen view of the busiest pids,
+refreshed in place.  Keys: q quit, p pause, / filter by command name.  The
+terminal handling and rendering are hand-written x86-64 assembly in tui.S.
+When stdout is not a terminal, or with --no-tui, the loader streams one line
+per event instead:
+
 Each line starts with seconds since the first event, then the event kind, the
 pid and tid, the command, and an argument: a path, a file descriptor, a signal,
 a mapping length, or the tcp_connect endpoints as saddr:sport -> daddr:dport.

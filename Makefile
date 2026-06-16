@@ -21,15 +21,15 @@ all: $(PROGS) $(HOSTPROGS)
 $(PROGS): $(INCS)
 
 ifeq ($(LLVM),1)
-%.o: %.S
+bpf/%.o: bpf/%.S
 	$(CLANG) $(BPF_CLANGFLAGS) -c $< -o $@
 else
-%.o: %.S
+bpf/%.o: bpf/%.S
 	$(AS) $(BPF_ASFLAGS) -o $@ $<
 endif
 
-asm-ebpf: tools/asm-ebpf.c
-	$(CC) $(CFLAGS) -o $@ $<
+asm-ebpf: tools/asm-ebpf.c tui.S
+	$(CC) $(CFLAGS) -o $@ tools/asm-ebpf.c tui.S
 
 dump: $(PROGS)
 	$(OBJDUMP) -d $(PROGS)
