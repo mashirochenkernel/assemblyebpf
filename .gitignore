@@ -2,3 +2,4 @@
 *.ll
 *.skel.h
 asm-ebpf
+error_injection.list

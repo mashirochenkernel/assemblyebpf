@@ -23,6 +23,47 @@
 	exit
 	.endm
 
+	.macro tripwire
+	mov %r6, %r1
+	mov %r1, 0
+	stxw [%r10+-4], %r1
+	lddw %r1, 0
+	mov %r2, %r10
+	add %r2, -4
+	call 1
+	jeq %r0, 0, 1f
+	ldxb %r1, [%r0+48]
+	jeq %r1, 0, 1f
+	mov %r9, %r0
+	mov %r1, 0
+	stxdw [%r10+-72], %r1
+	stxdw [%r10+-64], %r1
+	stxdw [%r10+-56], %r1
+	stxdw [%r10+-48], %r1
+	ldxdw %r3, [%r6+24]
+	mov %r1, %r10
+	add %r1, -72
+	mov %r2, 32
+	call 114
+	ldxdw %r1, [%r10+-72]
+	ldxdw %r2, [%r9+48]
+	jne %r1, %r2, 1f
+	ldxdw %r1, [%r10+-64]
+	ldxdw %r2, [%r9+56]
+	jne %r1, %r2, 1f
+	ldxdw %r1, [%r10+-56]
+	ldxdw %r2, [%r9+64]
+	jne %r1, %r2, 1f
+	ldxdw %r1, [%r10+-48]
+	ldxdw %r2, [%r9+72]
+	jne %r1, %r2, 1f
+	mov %r1, 9
+	call 109
+1:
+	mov %r0, 0
+	exit
+	.endm
+
 	.macro event_head kind
 	mov %r6, %r1
 	call 14

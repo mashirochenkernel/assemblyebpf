@@ -62,8 +62,8 @@ is open the overview tabs only count that pid; counters resume when it closes.
 Lists longer than the screen scroll: the arrows and page keys move through the
 tree, the connections and a pid's operations, and a footer shows the position.
 Keys: q quit or leave detail, esc leave detail, p pause, f kinds, d data,
-/ filter, arrows/pgup/pgdn scroll.  The per-kind counts and latency histogram
-are printed on exit.
+x inject (detail), / filter and t tripwire (pid view), arrows/pgup/pgdn scroll.
+The per-kind counts and latency histogram are printed on exit.
 The terminal handling and rendering are hand-written x86-64 assembly in tui.S.
 When stdout is not a terminal, or with --no-tui, the loader streams one line
 per event instead:
@@ -95,6 +95,20 @@ readable as root, which the loader already needs.
 Besides the syscall tracepoints the tree attaches kernel probes on tcp_connect,
 tcp_close, vfs_open, vfs_unlink and tcp_conn_request.  Probes on symbols the
 running kernel does not export are skipped.
+
+The tool does not only watch: two probes act on the kernel.  In the detail view
+x arms fault injection for the inspected pid: probes on the openat and connect
+handlers, which the kernel marks error-injectable, call bpf_override_return so
+the chosen process fails those calls with -EACCES while the real handler never
+runs.  It is scoped to that one pid and cleared on leaving the view.  In the pid
+view t arms a tripwire: a second program on the openat entry tracepoint reads
+the opened path with bpf_probe_read_user_str, compares it against a path typed
+into the config map, and calls bpf_send_signal to SIGKILL any process that opens
+it.  Both need the
+kernel built with error injection and signal helpers, and both undo themselves
+when the loader exits.  Rewriting a call's outcome and killing on a match are
+things a probe can do only in the kernel; this is where the tool stops being a
+pure observer.
 
 The loader filters out its own events.  Trailing names attach only the matching
 hooks; -p limits output to one pid and -n to one comm:

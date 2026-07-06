@@ -71,6 +71,7 @@ struct filter {
 	uint32_t inject_pid;
 	uint32_t pad2;
 	int64_t inject_ret;
+	char trip_path[64];
 };
 
 struct image {
@@ -143,6 +144,7 @@ static struct target targets[] = {
 	KP("bpf/kprobe.o", "asm_ebpf", "tcp_conn_request"),
 	KP0("bpf/inject.o", "asm_ebpf", "__x64_sys_openat"),
 	KP0("bpf/inject.o", "asm_ebpf", "__x64_sys_connect"),
+	LAT("bpf/trip.o", "syscalls/sys_enter_openat"),
 	LAT("bpf/lat.o", "syscalls/sys_enter_read"),
 	LAT("bpf/lat.o", "syscalls/sys_exit_read"),
 };
@@ -836,6 +838,7 @@ enum { KM_ALL, KM_NORW, KM_NETFILE, KM_COUNT };
 static const char *km_name[KM_COUNT] = { "all", "no-rw", "net+file" };
 static int detail_km;
 static int inject_on;
+static char trip_path[64];
 
 static uint64_t km_mask(int m)
 {
@@ -1621,8 +1624,8 @@ static void render_net(int rows, int *scroll)
 	tui_render(buf, p - buf);
 }
 
-static void render_top(int rows, const char *filter, int filt_mode, int *sel,
-		       int *scroll, int paused)
+static void render_top(int rows, const char *filter, int filt_mode,
+		       int trip_mode, int *sel, int *scroll, int paused)
 {
 	static char buf[65536];
 	struct win w;
@@ -1653,16 +1656,27 @@ static void render_top(int rows, const char *filter, int filt_mode, int *sel,
 	w.total = 0;
 
 	p = render_tabs(p, 2);
-	if (filt_mode) {
+	if (trip_mode) {
+		p = append(p, "  tripwire path: ");
+		p = append(p, trip_path);
+		p = append(p, "_");
+	} else if (filt_mode) {
 		p = append(p, "  filter: ");
 		p = append(p, filter);
 		p = append(p, "_");
-	} else if (filter[0]) {
-		p = append(p, "  filter=");
-		p = append(p, filter);
+	} else {
+		if (filter[0]) {
+			p = append(p, "  filter=");
+			p = append(p, filter);
+		}
+		if (trip_path[0]) {
+			p = append(p, "  TRIP ");
+			p = append(p, trip_path);
+			p = append(p, " -> SIGKILL");
+		}
 	}
 	p = append(p, paused ? "  [paused]" : "");
-	p = append(p, "   up/dn+enter:detail q:quit /:filter\r\n");
+	p = append(p, "   enter:detail /:filter t:tripwire q:quit\r\n");
 	p = append(p, "\033[K  ");
 	p = append_pad(p, "pid", 10);
 	p = append_pad(p, "comm", 18);
@@ -1812,7 +1826,17 @@ static void apply_detail_filter(void)
 		f.inject_pid = detail_pid;
 		f.inject_ret = -EACCES;
 	}
+	memcpy(f.trip_path, trip_path, sizeof(f.trip_path));
 	set_filter(config_fd, &f);
+}
+
+static void arm_tripwire(void)
+{
+	memcpy(base_filter.trip_path, trip_path, sizeof(base_filter.trip_path));
+	if (detail_mode)
+		apply_detail_filter();
+	else
+		set_filter(config_fd, &base_filter);
 }
 
 static void enter_detail(uint32_t pid)
@@ -1836,7 +1860,7 @@ static int tui_loop(void)
 {
 	struct pollfd *fds;
 	char filter[32] = { 0 };
-	int filt_mode = 0, paused = 0;
+	int filt_mode = 0, trip_mode = 0, paused = 0;
 	int view = 2, sel = 0, in_detail = 0, scroll = 0;
 	unsigned short trows = 24, tcols = 80;
 	int i;
@@ -1887,6 +1911,25 @@ static int tui_loop(void)
 				} else if (l < (int)sizeof(filter) - 1) {
 					filter[l] = key;
 					filter[l + 1] = '\0';
+				}
+				continue;
+			}
+			if (trip_mode) {
+				int l = strlen(trip_path);
+
+				if (key == '\r' || key == '\n') {
+					trip_mode = 0;
+					arm_tripwire();
+				} else if (key == 127 || key == 8) {
+					if (l)
+						trip_path[l - 1] = '\0';
+				} else if (key == 27) {
+					trip_mode = 0;
+					trip_path[0] = '\0';
+					arm_tripwire();
+				} else if (l < (int)sizeof(trip_path) - 1) {
+					trip_path[l] = key;
+					trip_path[l + 1] = '\0';
 				}
 				continue;
 			}
@@ -1955,6 +1998,9 @@ static int tui_loop(void)
 			else if (key == '/' && view == 2) {
 				filt_mode = 1;
 				filter[0] = '\0';
+			} else if (key == 't' && view == 2) {
+				trip_mode = 1;
+				memset(trip_path, 0, sizeof(trip_path));
 			} else if ((key == '\r' || key == '\n') &&
 				   view == 2 && sel < nr_prev) {
 				enter_detail(rows_cur[sel].pid);
@@ -1984,8 +2030,8 @@ static int tui_loop(void)
 			else if (view == 3)
 				render_net(trows, &scroll);
 			else
-				render_top(trows, filter, filt_mode, &sel,
-					   &scroll, paused);
+				render_top(trows, filter, filt_mode, trip_mode,
+					   &sel, &scroll, paused);
 		}
 	}
 
