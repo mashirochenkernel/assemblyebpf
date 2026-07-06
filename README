@@ -59,8 +59,11 @@ cycles which kinds the kernel emits (all, no read/write, net+file only), so a
 flooding syscall can be dropped before it ever leaves the kernel and the rare
 events keep flowing; d toggles the write-buffer preview.  While the detail view
 is open the overview tabs only count that pid; counters resume when it closes.
+Lists longer than the screen scroll: the arrows and page keys move through the
+tree, the connections and a pid's operations, and a footer shows the position.
 Keys: q quit or leave detail, esc leave detail, p pause, f kinds, d data,
-/ filter.  The per-kind counts and latency histogram are printed on exit.
+/ filter, arrows/pgup/pgdn scroll.  The per-kind counts and latency histogram
+are printed on exit.
 The terminal handling and rendering are hand-written x86-64 assembly in tui.S.
 When stdout is not a terminal, or with --no-tui, the loader streams one line
 per event instead:
@@ -82,6 +85,12 @@ The openat exit program keeps an fd-to-path index in a map keyed by thread and
 descriptor, so the read, write and close programs no longer show a bare number:
 the loader looks the path up and prints it.  One program fills the index and
 others read it, which is the kind of cross-program state only eBPF maps allow.
+
+The kernel probes capture the kernel call stack at the moment they fire with a
+stack-trace map, and the loader resolves the frames through /proc/kallsyms, so a
+tcp_connect line ends with the network path that reached it, such as
+[tcp_connect<-__inet_stream_connect<-__sys_connect].  Kernel addresses are only
+readable as root, which the loader already needs.
 
 Besides the syscall tracepoints the tree attaches kernel probes on tcp_connect,
 tcp_close, vfs_open, vfs_unlink and tcp_conn_request.  Probes on symbols the

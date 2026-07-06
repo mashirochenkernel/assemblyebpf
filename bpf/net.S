@@ -6,6 +6,7 @@
 	.global trace_tcp_connect
 trace_tcp_connect:
 	event_head 3
+	capture_stack
 	ldxdw %r8, [%r6+112]
 	mov %r1, %r10
 	add %r1, -192

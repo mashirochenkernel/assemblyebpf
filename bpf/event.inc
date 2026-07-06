@@ -116,6 +116,20 @@
 	event_out 56
 	.endm
 
+	.macro capture_stack
+	mov %r1, %r6
+	lddw %r2, 9
+	mov %r3, 0
+	call 27
+	stxw [%r10+-180], %r0
+	.endm
+
+	.macro emit_stack kind
+	event_head \kind
+	capture_stack
+	event_out 56
+	.endm
+
 	.macro emit_aux kind, off
 	event_head \kind
 	ldxdw %r1, [%r6+\off]
@@ -344,8 +358,9 @@
 	add %r2, -192
 	call 1
 	jeq %r0, 0, 8f
+	mov %r9, %r0
 	ldxdw %r1, [%r6+16]
-	stxdw [%r0+32], %r1
+	stxdw [%r9+32], %r1
 	jslt %r1, 0, 2f
 	mov %r8, %r7
 	rsh %r8, 32
@@ -355,7 +370,7 @@
 	lddw %r1, 8
 	mov %r2, %r10
 	add %r2, -208
-	mov %r3, %r0
+	mov %r3, %r9
 	add %r3, 56
 	mov %r4, 0
 	call 2
@@ -363,7 +378,7 @@
 	mov %r1, %r6
 	lddw %r2, 0
 	mov32 %r3, 0xffffffff
-	mov %r4, %r0
+	mov %r4, %r9
 	mov %r5, 184
 	call 25
 	stxdw [%r10+-192], %r7
