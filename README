@@ -134,6 +134,15 @@ timestamp keyed by thread, the exit program computes the delta, buckets it by
 power of two entirely in assembly, and accumulates a histogram map.  The loader
 prints the latency histogram on exit.
 
+A program on the scheduler's sched_switch tracepoint measures off-cpu time: the
+time a thread spends blocked, waiting rather than running.  When a thread is
+switched out in a sleeping state it stamps a start time keyed by thread; when it
+is switched back in the program adds the elapsed time to a per-thread total.
+The detail view sums these totals across a process's threads and shows the
+milliseconds it has spent blocked, which is where I/O and lock waits hide that
+the syscall counts alone do not reveal.  This runs on every context switch, so
+it is the busiest probe in the tree.
+
 
 TOOLCHAIN
 ---------

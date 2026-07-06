@@ -147,6 +147,7 @@ static struct target targets[] = {
 	LAT("bpf/trip.o", "syscalls/sys_enter_openat"),
 	LAT("bpf/lat.o", "syscalls/sys_enter_read"),
 	LAT("bpf/lat.o", "syscalls/sys_exit_read"),
+	LAT("bpf/off.o", "sched/sched_switch"),
 };
 
 static const struct evdesc {
@@ -201,6 +202,8 @@ static int pidstat_fd = -1;
 static int pending_fd = -1;
 static int fdpath_fd = -1;
 static int stack_fd = -1;
+static int offstart_fd = -1;
+static int offcpu_fd = -1;
 static int self_pid;
 
 #define STACK_FRAMES	16
@@ -374,6 +377,19 @@ static int create_startlat_map(void)
 }
 
 static int create_pidstat_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_HASH;
+	attr.key_size = sizeof(uint32_t);
+	attr.value_size = sizeof(uint64_t);
+	attr.max_entries = 16384;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int create_off_map(void)
 {
 	union bpf_attr attr;
 
@@ -1719,6 +1735,29 @@ static int by_seq_desc(const void *a, const void *b)
 	return 0;
 }
 
+static uint64_t sum_offcpu(uint32_t tgid)
+{
+	char path[64];
+	uint64_t total = 0, v;
+	struct dirent *e;
+	DIR *d;
+
+	snprintf(path, sizeof(path), "/proc/%u/task", tgid);
+	d = opendir(path);
+	if (!d)
+		return 0;
+	while ((e = readdir(d))) {
+		uint32_t tid = atoi(e->d_name);
+
+		if (!tid)
+			continue;
+		if (!lookup_stat(offcpu_fd, tid, &v))
+			total += v;
+	}
+	closedir(d);
+	return total;
+}
+
 static void render_detail(int rows, int *scroll)
 {
 	static char buf[65536];
@@ -1742,6 +1781,10 @@ static void render_detail(int rows, int *scroll)
 	p = append(p, inject_on ?
 		  "\033[K x:inject=ON  openat/connect forced to -EACCES for this pid\r\n"
 		: "\033[K x:inject=off (make this pid's openat/connect fail)\r\n");
+
+	p = append(p, "\033[K off-cpu (blocked, all threads): ");
+	p = append_u64(p, sum_offcpu(detail_pid) / 1000000, 0);
+	p = append(p, " ms\r\n");
 
 	p = append(p, "\033[K parents: ");
 	p = append(p, comm);
@@ -1788,7 +1831,7 @@ static void render_detail(int rows, int *scroll)
 	qsort(order, nrow, sizeof(order[0]), by_seq_desc);
 
 	w.scroll = *scroll;
-	w.visible = rows > 6 ? rows - 5 : 1;
+	w.visible = rows > 7 ? rows - 6 : 1;
 	w.ln = 0;
 	w.total = 0;
 	for (i = 0; i < nrow; i++) {
@@ -2221,6 +2264,12 @@ static int load_program(struct target *target)
 	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_2, 9, stack_fd) &&
 	    errno != ENOENT)
 		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 10, offstart_fd) &&
+	    errno != ENOENT)
+		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 11, offcpu_fd) &&
+	    errno != ENOENT)
+		goto err;
 	attr.insns = (uint64_t)((char *)img.data + prog->sh_offset);
 	attr.license = (uint64_t)((char *)img.data + license->sh_offset);
 	attr.log_buf = (uint64_t)log;
@@ -2453,6 +2502,8 @@ static void detach_all(void)
 	close_fd(&pending_fd);
 	close_fd(&fdpath_fd);
 	close_fd(&stack_fd);
+	close_fd(&offstart_fd);
+	close_fd(&offcpu_fd);
 }
 
 static void usage(const char *prog)
@@ -2528,9 +2579,12 @@ int main(int argc, char **argv)
 	pending_fd = create_pending_map();
 	fdpath_fd = create_fdpath_map();
 	stack_fd = create_stack_map();
+	offstart_fd = create_off_map();
+	offcpu_fd = create_off_map();
 	if (count_fd < 0 || bytes_fd < 0 || start_fd < 0 ||
 	    hist_fd < 0 || startlat_fd < 0 || pidstat_fd < 0 ||
-	    pending_fd < 0 || fdpath_fd < 0 || stack_fd < 0) {
+	    pending_fd < 0 || fdpath_fd < 0 || stack_fd < 0 ||
+	    offstart_fd < 0 || offcpu_fd < 0) {
 		die_errno("stat map");
 		detach_all();
 		free(sel);
