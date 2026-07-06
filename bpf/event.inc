@@ -1,5 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
+	.macro inject
+	mov %r6, %r1
+	mov %r1, 0
+	stxw [%r10+-4], %r1
+	lddw %r1, 0
+	mov %r2, %r10
+	add %r2, -4
+	call 1
+	jeq %r0, 0, 1f
+	mov %r9, %r0
+	ldxw %r7, [%r9+32]
+	jeq %r7, 0, 1f
+	call 14
+	rsh %r0, 32
+	jne %r0, %r7, 1f
+	mov %r1, %r6
+	ldxdw %r2, [%r9+40]
+	call 58
+1:
+	mov %r0, 0
+	exit
+	.endm
+
 	.macro event_head kind
 	mov %r6, %r1
 	call 14

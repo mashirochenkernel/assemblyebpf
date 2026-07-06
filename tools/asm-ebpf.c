@@ -45,6 +45,8 @@ unsigned long tui_human(char *dst, unsigned long val);
 	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, 1, NULL, NULL, 0 }
 #define KP(obj, group, name) \
 	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, 1, NULL, NULL, 0 }
+#define KP0(obj, group, name) \
+	{ obj, "kprobe/" name, BPF_PROG_TYPE_KPROBE, name, group, 0, NULL, NULL, 0 }
 #define LAT(obj, name) \
 	{ obj, "tracepoint/" name, BPF_PROG_TYPE_TRACEPOINT, name, NULL, 0, NULL, NULL, 0 }
 
@@ -66,6 +68,9 @@ struct filter {
 	uint32_t have_comm;
 	char comm[16];
 	uint64_t kinds;
+	uint32_t inject_pid;
+	uint32_t pad2;
+	int64_t inject_ret;
 };
 
 struct image {
@@ -136,6 +141,8 @@ static struct target targets[] = {
 	KP("bpf/kprobe.o", "asm_ebpf", "vfs_open"),
 	KP("bpf/kprobe.o", "asm_ebpf", "vfs_unlink"),
 	KP("bpf/kprobe.o", "asm_ebpf", "tcp_conn_request"),
+	KP0("bpf/inject.o", "asm_ebpf", "__x64_sys_openat"),
+	KP0("bpf/inject.o", "asm_ebpf", "__x64_sys_connect"),
 	LAT("bpf/lat.o", "syscalls/sys_enter_read"),
 	LAT("bpf/lat.o", "syscalls/sys_exit_read"),
 };
@@ -828,6 +835,7 @@ static uint32_t detail_pid;
 enum { KM_ALL, KM_NORW, KM_NETFILE, KM_COUNT };
 static const char *km_name[KM_COUNT] = { "all", "no-rw", "net+file" };
 static int detail_km;
+static int inject_on;
 
 static uint64_t km_mask(int m)
 {
@@ -1717,6 +1725,9 @@ static void render_detail(int rows, int *scroll)
 	p = append(p, km_name[detail_km]);
 	p = append(p, show_data ? "  d:data=on" : "  d:data=off");
 	p = append(p, "   esc:back p:pause q:quit\r\n");
+	p = append(p, inject_on ?
+		  "\033[K x:inject=ON  openat/connect forced to -EACCES for this pid\r\n"
+		: "\033[K x:inject=off (make this pid's openat/connect fail)\r\n");
 
 	p = append(p, "\033[K parents: ");
 	p = append(p, comm);
@@ -1797,6 +1808,10 @@ static void apply_detail_filter(void)
 	memset(&f, 0, sizeof(f));
 	f.pid = detail_pid;
 	f.kinds = km_mask(detail_km);
+	if (inject_on) {
+		f.inject_pid = detail_pid;
+		f.inject_ret = -EACCES;
+	}
 	set_filter(config_fd, &f);
 }
 
@@ -1805,6 +1820,7 @@ static void enter_detail(uint32_t pid)
 	drain_perf();			/* discard the pre-filter backlog */
 	detail_reset(pid);
 	detail_km = KM_ALL;
+	inject_on = 0;			/* injection always starts disabled */
 	apply_detail_filter();
 	detail_mode = 1;
 }
@@ -1921,6 +1937,10 @@ static int tui_loop(void)
 					apply_detail_filter();
 				} else if (key == 'd')
 					show_data = !show_data;
+				else if (key == 'x') {
+					inject_on = !inject_on;
+					apply_detail_filter();
+				}
 				continue;
 			} else if (key == '1') {
 				view = 1;
