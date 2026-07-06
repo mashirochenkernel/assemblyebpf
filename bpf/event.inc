@@ -40,6 +40,21 @@
 	mov %r0, 0
 	exit
 3:
+	mov %r1, 0
+	stxw [%r10+-184], %r1
+	lddw %r1, 0
+	mov %r2, %r10
+	add %r2, -184
+	call 1
+	jeq %r0, 0, .Lkok\@
+	ldxdw %r1, [%r0+24]
+	jeq %r1, 0, .Lkok\@
+	lddw %r2, (1 << \kind)
+	and %r1, %r2
+	jne %r1, 0, .Lkok\@
+	mov %r0, 0
+	exit
+.Lkok\@:
 	mov %r1, \kind
 	stxw [%r10+-184], %r1
 	lddw %r1, 1

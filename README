@@ -44,9 +44,19 @@ The asm-ebpf loader loads and attaches the assembled programs:
 It keeps running until interrupted.  It needs the usual privileges for loading
 eBPF programs and opening tracing events.
 
-On a terminal the loader shows a live full-screen view of the busiest pids,
-refreshed in place.  Keys: q quit, p pause, / filter by command name.  The
-terminal handling and rendering are hand-written x86-64 assembly in tui.S.
+On a terminal the loader shows a live full-screen view, refreshed in place.
+Three overview tabs switch with 1, 2 and 3: event counts, the busiest pids,
+and the read latency histogram.  In the pid view the up and down arrows move
+the highlight and enter opens a detail view for that pid; there the upper half
+keeps a per-kind tally and the lower half lists its operations with repeats
+collapsed into a counter, so a flood of one syscall cannot scroll the rare,
+useful events away.  The detail view narrows the in-kernel filter to the chosen
+pid, and f cycles which kinds the kernel emits (all, no read/write, net+file
+only), so a flooding syscall can be dropped before it ever leaves the kernel and
+the rare events keep flowing.  While the detail view is open the overview tabs
+only count that pid; the other counters resume when it is closed.
+Keys: q quit or leave detail, esc leave detail, p pause, f kinds, / filter.
+The terminal handling and rendering are hand-written x86-64 assembly in tui.S.
 When stdout is not a terminal, or with --no-tui, the loader streams one line
 per event instead:
 

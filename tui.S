@@ -15,6 +15,8 @@
 
 	.set	ICANON, 0x2
 	.set	ECHO, 0x8
+	.set	ICRNL, 0x100
+	.set	IXON, 0x400
 	.set	VTIME_OFF, 22
 	.set	VMIN_OFF, 23
 
@@ -51,6 +53,9 @@ tui_init:
 	jnz	2b
 
 	lea	raw_termios(%rip), %rdi
+	mov	(%rdi), %eax
+	and	$~(ICRNL | IXON), %eax
+	mov	%eax, (%rdi)
 	mov	12(%rdi), %eax
 	and	$~(ICANON | ECHO), %eax
 	mov	%eax, 12(%rdi)

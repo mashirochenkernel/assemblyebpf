@@ -61,6 +61,7 @@ struct filter {
 	uint32_t pid;
 	uint32_t have_comm;
 	char comm[16];
+	uint64_t kinds;
 };
 
 struct image {
@@ -189,6 +190,8 @@ static int reported_lost;
 static int reported_record;
 static volatile sig_atomic_t stop_flag;
 static int tui_on;
+static int detail_mode;
+static struct filter base_filter;
 
 static void on_signal(int sig)
 {
@@ -515,6 +518,141 @@ static void print_event(const struct event *event, int has_arg)
 	putchar('\n');
 }
 
+/*
+ * The detail view collapses repeated operations into one row with a counter,
+ * so a thread that floods one syscall shows as a single growing line instead
+ * of scrolling the rare, useful events off the screen.
+ */
+#define DETAIL_ROWS	64
+#define DETAIL_TEXT	100
+
+struct drow {
+	char text[DETAIL_TEXT];
+	uint64_t count;
+	uint64_t seq;
+};
+
+static struct drow detail_rows[DETAIL_ROWS];
+static uint64_t detail_seq;
+static uint64_t detail_kind[ARRAY_SIZE(evdescs)];
+static uint32_t detail_pid;
+
+enum { KM_ALL, KM_NORW, KM_NETFILE, KM_COUNT };
+static const char *km_name[KM_COUNT] = { "all", "no-rw", "net+file" };
+static int detail_km;
+
+static uint64_t km_mask(int m)
+{
+	static const int keep[] = { 1, 3, 4, 8, 9, 10, 11, 12, 13, 14,
+				    15, 16, 17, 18 };
+	uint64_t mask = 0;
+	size_t i;
+
+	if (m == KM_NORW) {
+		for (i = 1; i < ARRAY_SIZE(evdescs); i++)
+			if (evdescs[i].name)
+				mask |= 1ULL << i;
+		mask &= ~(1ULL << 5);
+		mask &= ~(1ULL << 6);
+	} else if (m == KM_NETFILE) {
+		for (i = 0; i < ARRAY_SIZE(keep); i++)
+			mask |= 1ULL << keep[i];
+	}
+	return mask;
+}
+
+static void detail_reset(uint32_t pid)
+{
+	detail_pid = pid;
+	detail_seq = 0;
+	memset(detail_rows, 0, sizeof(detail_rows));
+	memset(detail_kind, 0, sizeof(detail_kind));
+}
+
+static void event_summary(char *out, int cap, const struct event *event,
+			  int has_arg)
+{
+	const struct evdesc *desc = NULL;
+	int off;
+
+	if (event->kind < ARRAY_SIZE(evdescs))
+		desc = &evdescs[event->kind];
+
+	off = snprintf(out, cap, "%-9s",
+		       desc && desc->name ? desc->name : "unknown");
+	if (off < 0 || off >= cap) {
+		out[cap - 1] = '\0';
+		return;
+	}
+
+	if (event->kind == 3) {
+		uint32_t daddr = event->aux & 0xffffffff;
+		uint16_t dport = (event->aux >> 32) & 0xffff;
+		uint32_t saddr;
+		uint16_t sport;
+		const unsigned char *d = (const unsigned char *)&daddr;
+		const unsigned char *s;
+
+		memcpy(&saddr, event->arg, 4);
+		memcpy(&sport, event->arg + 4, 2);
+		s = (const unsigned char *)&saddr;
+		snprintf(out + off, cap - off,
+			 " %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
+			 s[0], s[1], s[2], s[3], sport,
+			 d[0], d[1], d[2], d[3], ntohs(dport));
+	} else if (has_arg) {
+		int room = cap - off - 1;
+
+		snprintf(out + off, cap - off, " %.*s",
+			 room < (int)sizeof(event->arg) ? room
+						        : (int)sizeof(event->arg),
+			 event->arg);
+	} else if (event->kind == 2 && event->aux) {
+		snprintf(out + off, cap - off, " life=%.3fms",
+			 event->aux / 1e6);
+	} else if (desc && desc->label) {
+		snprintf(out + off, cap - off, " %s=%llu", desc->label,
+			 (unsigned long long)event->aux);
+	}
+}
+
+static void detail_capture(const struct event *event, int has_arg)
+{
+	char text[DETAIL_TEXT];
+	int i, slot = -1, oldest = -1;
+
+	if ((uint32_t)(event->pid_tgid >> 32) != detail_pid)
+		return;
+	if (event->kind < ARRAY_SIZE(evdescs))
+		detail_kind[event->kind]++;
+
+	event_summary(text, sizeof(text), event, has_arg);
+
+	for (i = 0; i < DETAIL_ROWS; i++) {
+		if (!detail_rows[i].count) {
+			if (slot < 0)
+				slot = i;
+			continue;
+		}
+		if (oldest < 0 || detail_rows[i].seq < detail_rows[oldest].seq)
+			oldest = i;
+		if (!strcmp(detail_rows[i].text, text)) {
+			detail_rows[i].count++;
+			detail_rows[i].seq = ++detail_seq;
+			return;
+		}
+	}
+
+	if (slot < 0)
+		slot = oldest;
+	if (slot < 0)
+		return;
+	memcpy(detail_rows[slot].text, text, DETAIL_TEXT);
+	detail_rows[slot].text[DETAIL_TEXT - 1] = '\0';
+	detail_rows[slot].count = 1;
+	detail_rows[slot].seq = ++detail_seq;
+}
+
 static void dump_counts(void)
 {
 	uint64_t total = 0;
@@ -667,7 +805,10 @@ static void read_one(struct perf_reader *reader)
 			if (raw_len >= EVENT_HEAD &&
 			    raw_len <= sizeof(struct event) &&
 			    sizeof(*hdr) + 4 + raw_len <= len) {
-				if (!tui_on)
+				if (detail_mode)
+					detail_capture((void *)(buf + sizeof(*hdr) + 4),
+						       raw_len >= sizeof(struct event));
+				else if (!tui_on)
 					print_event((void *)(buf + sizeof(*hdr) + 4),
 						    raw_len >= sizeof(struct event));
 			} else if (!reported_bad_sample) {
@@ -783,7 +924,107 @@ static char *append_pad(char *p, const char *s, int width)
 	return p;
 }
 
-static void render_top(int rows, const char *filter)
+static char *append_u64(char *p, uint64_t v, int width)
+{
+	char num[24];
+
+	num[tui_u64(num, v)] = '\0';
+	if (width)
+		return append_pad(p, num, width);
+	return append(p, num);
+}
+
+static char *render_tabs(char *p, int view)
+{
+	p = append(p, "\033[K asm-ebpf   ");
+	p = append(p, view == 1 ? "[1 counts]" : " 1 counts ");
+	p = append(p, view == 2 ? "[2 pids]" : " 2 pids ");
+	p = append(p, view == 3 ? "[3 latency]" : " 3 latency ");
+	return p;
+}
+
+static void render_counts(int rows)
+{
+	static char buf[65536];
+	char *p = buf;
+	size_t i;
+	int line = 2;
+
+	p = render_tabs(p, 1);
+	p = append(p, "   q:quit p:pause\r\n");
+	p = append(p, "\033[K ");
+	p = append_pad(p, "event", 10);
+	p = append_pad(p, "count", 14);
+	p = append(p, "bytes\r\n");
+
+	for (i = 0; i < ARRAY_SIZE(evdescs) && line < rows - 1; i++) {
+		uint64_t value, bytes = 0;
+
+		if (!evdescs[i].name || lookup_stat(count_fd, i, &value))
+			continue;
+		if (!value)
+			continue;
+		lookup_stat(bytes_fd, i, &bytes);
+		p = append(p, "\033[K ");
+		p = append_pad(p, evdescs[i].name, 10);
+		p = append_u64(p, value, 14);
+		if (bytes)
+			p = append_u64(p, bytes, 0);
+		p = append(p, "\r\n");
+		line++;
+	}
+	p = append(p, "\033[J");
+	tui_render(buf, p - buf);
+}
+
+static void render_hist(int rows)
+{
+	static char buf[65536];
+	uint64_t slots[HIST_SLOTS] = { 0 };
+	uint64_t max = 0;
+	char *p = buf;
+	int i, hi = 0, line = 2;
+
+	for (i = 0; i < HIST_SLOTS; i++) {
+		if (lookup_stat(hist_fd, i, &slots[i]))
+			continue;
+		if (slots[i]) {
+			hi = i;
+			if (slots[i] > max)
+				max = slots[i];
+		}
+	}
+
+	p = render_tabs(p, 3);
+	p = append(p, "   read latency (ns)\r\n");
+	if (!max) {
+		p = append(p, "\033[K (no samples yet)\r\n\033[J");
+		tui_render(buf, p - buf);
+		return;
+	}
+	for (i = 0; i <= hi && line < rows - 1; i++) {
+		uint64_t lo = i ? 1ULL << i : 0;
+		uint64_t up = i < 63 ? (1ULL << (i + 1)) - 1 : ~0ULL;
+		int bar = (int)(slots[i] * 40 / max);
+		int j;
+
+		p = append(p, "\033[K ");
+		p = append_u64(p, lo, 12);
+		p = append(p, " ");
+		p = append_u64(p, up, 14);
+		p = append(p, " |");
+		for (j = 0; j < bar; j++)
+			*p++ = '*';
+		p = append(p, " ");
+		p = append_u64(p, slots[i], 0);
+		p = append(p, "\r\n");
+		line++;
+	}
+	p = append(p, "\033[J");
+	tui_render(buf, p - buf);
+}
+
+static void render_top(int rows, const char *filter, int filt_mode, int sel)
 {
 	static char buf[65536];
 	char comm[32];
@@ -793,13 +1034,17 @@ static void render_top(int rows, const char *filter)
 	n = snapshot_pids();
 	qsort(rows_cur, n, sizeof(rows_cur[0]), by_rate);
 
-	p = append(p, "\033[K asm-ebpf  top pids");
-	if (filter[0]) {
+	p = render_tabs(p, 2);
+	if (filt_mode) {
+		p = append(p, "  filter: ");
+		p = append(p, filter);
+		p = append(p, "_");
+	} else if (filter[0]) {
 		p = append(p, "  filter=");
 		p = append(p, filter);
 	}
-	p = append(p, "   q:quit p:pause /:filter 1/2/3:view\r\n");
-	p = append(p, "\033[K ");
+	p = append(p, "   up/dn+enter:detail q:quit /:filter\r\n");
+	p = append(p, "\033[K  ");
 	p = append_pad(p, "pid", 10);
 	p = append_pad(p, "comm", 18);
 	p = append_pad(p, "events", 12);
@@ -809,20 +1054,17 @@ static void render_top(int rows, const char *filter)
 	if (limit > 512)
 		limit = 512;
 	for (i = 0; i < n && shown < limit; i++) {
-		char num[32];
-
 		if (read_comm(rows_cur[i].pid, comm, sizeof(comm)))
 			strcpy(comm, "?");
 		if (filter[0] && !strstr(comm, filter))
 			continue;
-		p = append(p, "\033[K ");
-		num[tui_u64(num, rows_cur[i].pid)] = '\0';
-		p = append_pad(p, num, 10);
+		p = append(p, "\033[K");
+		p = append(p, i == sel ? ">" : " ");
+		p = append(p, " ");
+		p = append_u64(p, rows_cur[i].pid, 10);
 		p = append_pad(p, comm, 18);
-		num[tui_u64(num, rows_cur[i].total)] = '\0';
-		p = append_pad(p, num, 12);
-		num[tui_u64(num, rows_cur[i].rate)] = '\0';
-		p = append(p, num);
+		p = append_u64(p, rows_cur[i].total, 12);
+		p = append_u64(p, rows_cur[i].rate, 0);
 		p = append(p, "\r\n");
 		shown++;
 	}
@@ -834,11 +1076,113 @@ static void render_top(int rows, const char *filter)
 	nr_prev = n;
 }
 
+static int by_seq_desc(const void *a, const void *b)
+{
+	uint64_t x = detail_rows[*(const int *)a].seq;
+	uint64_t y = detail_rows[*(const int *)b].seq;
+
+	if (x != y)
+		return y > x ? 1 : -1;
+	return 0;
+}
+
+static void render_detail(int rows)
+{
+	static char buf[65536];
+	char comm[32];
+	char num[24];
+	char *p = buf;
+	int order[DETAIL_ROWS];
+	int i, col = 0, nrow = 0, avail;
+
+	if (read_comm(detail_pid, comm, sizeof(comm)))
+		strcpy(comm, "?");
+
+	p = append(p, "\033[K asm-ebpf  detail pid=");
+	p = append_u64(p, detail_pid, 0);
+	p = append(p, " comm=");
+	p = append(p, comm);
+	p = append(p, "  f:kinds=");
+	p = append(p, km_name[detail_km]);
+	p = append(p, "   esc:back p:pause q:quit\r\n");
+
+	p = append(p, "\033[K ");
+	for (i = 0; i < (int)ARRAY_SIZE(detail_kind); i++) {
+		if (!detail_kind[i] || !evdescs[i].name)
+			continue;
+		p = append(p, evdescs[i].name);
+		p = append(p, "=");
+		p = append_u64(p, detail_kind[i], 0);
+		p = append(p, "  ");
+		if (++col % 6 == 0)
+			p = append(p, "\r\n\033[K ");
+	}
+	p = append(p, "\r\n\033[K --- operations (repeats collapsed) ---\r\n");
+
+	for (i = 0; i < DETAIL_ROWS; i++)
+		if (detail_rows[i].count)
+			order[nrow++] = i;
+	qsort(order, nrow, sizeof(order[0]), by_seq_desc);
+
+	avail = rows - 5;
+	if (avail > nrow)
+		avail = nrow;
+	if (avail < 0)
+		avail = 0;
+	for (i = 0; i < avail; i++) {
+		struct drow *r = &detail_rows[order[i]];
+
+		p = append(p, "\033[K ");
+		num[tui_u64(num, r->count)] = '\0';
+		p = append(p, "x");
+		p = append_pad(p, num, 9);
+		p = append(p, r->text);
+		p = append(p, "\r\n");
+	}
+	p = append(p, "\033[J");
+	tui_render(buf, p - buf);
+}
+
+static void drain_perf(void)
+{
+	int i;
+
+	for (i = 0; i < nr_readers; i++)
+		read_one(&readers[i]);
+}
+
+static void apply_detail_filter(void)
+{
+	struct filter f;
+
+	memset(&f, 0, sizeof(f));
+	f.pid = detail_pid;
+	f.kinds = km_mask(detail_km);
+	set_filter(config_fd, &f);
+}
+
+static void enter_detail(uint32_t pid)
+{
+	drain_perf();			/* discard the pre-filter backlog */
+	detail_reset(pid);
+	detail_km = KM_ALL;
+	apply_detail_filter();
+	detail_mode = 1;
+}
+
+static void leave_detail(void)
+{
+	detail_mode = 0;
+	if (set_filter(config_fd, &base_filter))
+		set_filter(config_fd, &base_filter);
+}
+
 static int tui_loop(void)
 {
 	struct pollfd *fds;
 	char filter[32] = { 0 };
 	int filt_mode = 0, paused = 0;
+	int view = 2, sel = 0, in_detail = 0;
 	unsigned short trows = 24, tcols = 80;
 	int i;
 
@@ -859,17 +1203,21 @@ static int tui_loop(void)
 
 	(void)tcols;
 	while (!stop_flag) {
-		int key;
+		int key, dirty = 0;
+		int nfds = in_detail ? nr_readers + 1 : 1;
+		struct pollfd *pf = in_detail ? fds : &fds[nr_readers];
+		int ret = poll(pf, nfds, in_detail ? 200 : 500);
 
-		if (poll(fds, nr_readers + 1, 500) < 0) {
+		if (ret < 0) {
 			if (errno == EINTR)
 				break;
 			break;
 		}
-		for (i = 0; i < nr_readers; i++)
-			read_one(&readers[i]);
+		if (in_detail && !paused)
+			drain_perf();
 
 		while ((key = tui_readkey()) >= 0) {
+			dirty = 1;
 			if (filt_mode) {
 				int l = strlen(filter);
 
@@ -887,22 +1235,77 @@ static int tui_loop(void)
 				}
 				continue;
 			}
-			if (key == 'q')
-				stop_flag = 1;
-			else if (key == 'p')
+			if (key == 27) {		/* ESC: arrows or back */
+				int k1 = tui_readkey();
+
+				if (k1 == '[') {
+					int k2 = tui_readkey();
+
+					if (k2 == 'A' && sel > 0)
+						sel--;
+					else if (k2 == 'B')
+						sel++;
+				} else if (in_detail) {
+					leave_detail();
+					in_detail = 0;
+				}
+				continue;
+			}
+			if (key == 'q') {
+				if (in_detail) {
+					leave_detail();
+					in_detail = 0;
+				} else
+					stop_flag = 1;
+			} else if (key == 'p')
 				paused = !paused;
-			else if (key == '/')
+			else if (in_detail) {
+				if (key == 'f') {
+					detail_km = (detail_km + 1) % KM_COUNT;
+					apply_detail_filter();
+				}
+				continue;
+			} else if (key == '1')
+				view = 1;
+			else if (key == '2')
+				view = 2;
+			else if (key == '3')
+				view = 3;
+			else if (key == '/' && view == 2) {
 				filt_mode = 1;
+				filter[0] = '\0';
+			} else if ((key == '\r' || key == '\n') &&
+				   view == 2 && sel < nr_prev) {
+				enter_detail(rows_cur[sel].pid);
+				in_detail = 1;
+			}
 		}
 
-		if (!paused) {
-			tui_winsize(&trows, &tcols);
-			if (trows < 6)
-				trows = 6;
-			render_top(trows, filter);
+		if (stop_flag)
+			break;
+
+		if (sel >= nr_prev)
+			sel = nr_prev ? nr_prev - 1 : 0;
+
+		tui_winsize(&trows, &tcols);
+		if (trows < 6)
+			trows = 6;
+
+		if (in_detail) {
+			if (!paused || dirty)
+				render_detail(trows);
+		} else if (!paused || dirty) {
+			if (view == 1)
+				render_counts(trows);
+			else if (view == 3)
+				render_hist(trows);
+			else
+				render_top(trows, filter, filt_mode, sel);
 		}
 	}
 
+	if (in_detail)
+		leave_detail();
 	tui_fini();
 	free(fds);
 	return 0;
@@ -1354,6 +1757,7 @@ int main(int argc, char **argv)
 
 	self_pid = getpid();
 	tui_on = !no_tui && isatty(1);
+	base_filter = filter;
 
 	events_fd = create_perf_map();
 	if (events_fd < 0) {
