@@ -78,6 +78,11 @@ with = <fd> or = -ENOENT.
 The write program also copies the first bytes of the buffer, shown as a quoted
 preview; d toggles it in the detail view for privacy.
 
+The openat exit program keeps an fd-to-path index in a map keyed by thread and
+descriptor, so the read, write and close programs no longer show a bare number:
+the loader looks the path up and prints it.  One program fills the index and
+others read it, which is the kind of cross-program state only eBPF maps allow.
+
 Besides the syscall tracepoints the tree attaches kernel probes on tcp_connect,
 tcp_close, vfs_open, vfs_unlink and tcp_conn_request.  Probes on symbols the
 running kernel does not export are skipped.

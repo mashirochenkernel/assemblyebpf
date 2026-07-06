@@ -189,6 +189,7 @@ static int hist_fd = -1;
 static int startlat_fd = -1;
 static int pidstat_fd = -1;
 static int pending_fd = -1;
+static int fdpath_fd = -1;
 static int self_pid;
 static struct perf_reader *readers;
 static int nr_readers;
@@ -318,6 +319,32 @@ static int create_pending_map(void)
 	attr.max_entries = 16384;
 
 	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int create_fdpath_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_HASH;
+	attr.key_size = sizeof(uint64_t);
+	attr.value_size = 128;
+	attr.max_entries = 16384;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int lookup_fdpath(uint64_t pid_tgid, uint64_t fd, char *out)
+{
+	union bpf_attr attr;
+	uint64_t key = (pid_tgid & 0xffffffff00000000ULL) | (fd & 0xffffffff);
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_fd = fdpath_fd;
+	attr.key = (uint64_t)&key;
+	attr.value = (uint64_t)out;
+
+	return sys_bpf(BPF_MAP_LOOKUP_ELEM, &attr);
 }
 
 static int set_filter(int map_fd, const struct filter *filter)
@@ -609,6 +636,15 @@ static void print_event(const struct event *event, int has_arg)
 		printf(" %s=%llu", desc->label,
 		       (unsigned long long)event->aux);
 	}
+	if (event->kind == 5 || event->kind == 6 || event->kind == 7) {
+		char path[128];
+
+		if (!lookup_fdpath(event->pid_tgid, event->aux, path) &&
+		    path[0]) {
+			path[sizeof(path) - 1] = '\0';
+			printf(" %.100s", path);
+		}
+	}
 	if (has_ret(event->kind)) {
 		if (event->ret < 0)
 			printf(" = -%s", strerror((int)-event->ret));
@@ -720,6 +756,17 @@ static void event_summary(char *out, int cap, const struct event *event,
 			 (unsigned long long)event->aux);
 	}
 
+	if (event->kind == 5 || event->kind == 6 || event->kind == 7) {
+		char path[128];
+		int len = strlen(out);
+
+		if (!lookup_fdpath(event->pid_tgid, event->aux, path) &&
+		    path[0] && len < cap - 4) {
+			path[sizeof(path) - 1] = '\0';
+			snprintf(out + len, cap - len, " %.*s",
+				 cap - len - 2, path);
+		}
+	}
 	if (event->kind == 6 && show_data) {
 		int len = strlen(out);
 
@@ -1811,6 +1858,9 @@ static int load_program(struct target *target)
 	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 7, pending_fd) &&
 	    errno != ENOENT)
 		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 8, fdpath_fd) &&
+	    errno != ENOENT)
+		goto err;
 	attr.insns = (uint64_t)((char *)img.data + prog->sh_offset);
 	attr.license = (uint64_t)((char *)img.data + license->sh_offset);
 	attr.log_buf = (uint64_t)log;
@@ -2041,6 +2091,7 @@ static void detach_all(void)
 	close_fd(&startlat_fd);
 	close_fd(&pidstat_fd);
 	close_fd(&pending_fd);
+	close_fd(&fdpath_fd);
 }
 
 static void usage(const char *prog)
@@ -2110,9 +2161,10 @@ int main(int argc, char **argv)
 	startlat_fd = create_startlat_map();
 	pidstat_fd = create_pidstat_map();
 	pending_fd = create_pending_map();
+	fdpath_fd = create_fdpath_map();
 	if (count_fd < 0 || bytes_fd < 0 || start_fd < 0 ||
 	    hist_fd < 0 || startlat_fd < 0 || pidstat_fd < 0 ||
-	    pending_fd < 0) {
+	    pending_fd < 0 || fdpath_fd < 0) {
 		die_errno("stat map");
 		detach_all();
 		free(sel);

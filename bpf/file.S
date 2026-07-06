@@ -10,7 +10,7 @@ trace_openat:
 	.section "tracepoint/syscalls/sys_exit_openat", "ax"
 	.global trace_openat_exit
 trace_openat_exit:
-	emit_exit_ret
+	emit_exit_fdpath
 
 	.section "license", "a"
 _license:

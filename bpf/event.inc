@@ -333,3 +333,45 @@
 	mov %r0, 0
 	exit
 	.endm
+
+	.macro emit_exit_fdpath
+	mov %r6, %r1
+	call 14
+	mov %r7, %r0
+	stxdw [%r10+-192], %r7
+	lddw %r1, 7
+	mov %r2, %r10
+	add %r2, -192
+	call 1
+	jeq %r0, 0, 8f
+	ldxdw %r1, [%r6+16]
+	stxdw [%r0+32], %r1
+	jslt %r1, 0, 2f
+	mov %r8, %r7
+	rsh %r8, 32
+	lsh %r8, 32
+	or %r8, %r1
+	stxdw [%r10+-208], %r8
+	lddw %r1, 8
+	mov %r2, %r10
+	add %r2, -208
+	mov %r3, %r0
+	add %r3, 56
+	mov %r4, 0
+	call 2
+2:
+	mov %r1, %r6
+	lddw %r2, 0
+	mov32 %r3, 0xffffffff
+	mov %r4, %r0
+	mov %r5, 184
+	call 25
+	stxdw [%r10+-192], %r7
+	lddw %r1, 7
+	mov %r2, %r10
+	add %r2, -192
+	call 3
+8:
+	mov %r0, 0
+	exit
+	.endm
