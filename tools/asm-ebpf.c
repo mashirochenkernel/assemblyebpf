@@ -2,8 +2,10 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
 #include <linux/unistd.h>
@@ -51,6 +53,7 @@ struct event {
 	uint64_t pid_tgid;
 	uint64_t ts;
 	uint64_t aux;
+	int64_t ret;
 	char comm[16];
 	char arg[128];
 };
@@ -97,11 +100,14 @@ static struct target targets[] = {
 	TP("bpf/syscall.o", "syscalls/sys_enter_execve"),
 	TP("bpf/process.o", "sched/sched_process_exit"),
 	TP("bpf/file.o", "syscalls/sys_enter_openat"),
+	LAT("bpf/file.o", "syscalls/sys_exit_openat"),
 	TP("bpf/io.o", "syscalls/sys_enter_read"),
 	TP("bpf/io.o", "syscalls/sys_enter_write"),
 	TP("bpf/io.o", "syscalls/sys_enter_close"),
 	TP("bpf/socket.o", "syscalls/sys_enter_connect"),
+	LAT("bpf/socket.o", "syscalls/sys_exit_connect"),
 	TP("bpf/socket.o", "syscalls/sys_enter_accept4"),
+	LAT("bpf/socket.o", "syscalls/sys_exit_accept4"),
 	TP("bpf/socket.o", "syscalls/sys_enter_sendto"),
 	TP("bpf/socket.o", "syscalls/sys_enter_recvfrom"),
 	TP("bpf/fs.o", "syscalls/sys_enter_newfstatat"),
@@ -182,6 +188,7 @@ static int start_fd = -1;
 static int hist_fd = -1;
 static int startlat_fd = -1;
 static int pidstat_fd = -1;
+static int pending_fd = -1;
 static int self_pid;
 static struct perf_reader *readers;
 static int nr_readers;
@@ -295,6 +302,19 @@ static int create_pidstat_map(void)
 	attr.map_type = BPF_MAP_TYPE_HASH;
 	attr.key_size = sizeof(uint32_t);
 	attr.value_size = sizeof(uint64_t);
+	attr.max_entries = 16384;
+
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int create_pending_map(void)
+{
+	union bpf_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_HASH;
+	attr.key_size = sizeof(uint64_t);
+	attr.value_size = sizeof(struct event);
 	attr.max_entries = 16384;
 
 	return sys_bpf(BPF_MAP_CREATE, &attr);
@@ -475,9 +495,77 @@ err:
 
 static uint64_t start_ts;
 
+static int has_ret(uint32_t kind)
+{
+	return kind == 4 || kind == 8 || kind == 9;
+}
+
+static void append_ret(char *out, int cap, const struct event *event)
+{
+	int len = strlen(out);
+
+	if (cap - len < 8)
+		return;
+	if (event->ret < 0)
+		snprintf(out + len, cap - len, " = -%s",
+			 strerror((int)-event->ret));
+	else
+		snprintf(out + len, cap - len, " = %lld",
+			 (long long)event->ret);
+}
+
+static int show_data = 1;
+
+static int format_data(char *out, int cap, const char *data, int n)
+{
+	int len = 0, i;
+
+	if (cap < 4)
+		return 0;
+	out[len++] = ' ';
+	out[len++] = '"';
+	for (i = 0; i < n && len < cap - 2; i++) {
+		unsigned char c = data[i];
+
+		if (c >= 0x20 && c < 0x7f)
+			out[len++] = c;
+		else if (c == '\n' && len < cap - 3) {
+			out[len++] = '\\';
+			out[len++] = 'n';
+		} else
+			out[len++] = '.';
+	}
+	out[len++] = '"';
+	out[len] = '\0';
+	return len;
+}
+
+static int format_sockaddr(char *out, int cap, const char *sa)
+{
+	uint16_t family, port;
+
+	memcpy(&family, sa, 2);
+	memcpy(&port, sa + 2, 2);
+	if (family == AF_INET) {
+		const unsigned char *a = (const unsigned char *)(sa + 4);
+
+		return snprintf(out, cap, " %u.%u.%u.%u:%u",
+				a[0], a[1], a[2], a[3], ntohs(port));
+	}
+	if (family == AF_INET6) {
+		char ip[INET6_ADDRSTRLEN];
+
+		if (!inet_ntop(AF_INET6, sa + 8, ip, sizeof(ip)))
+			strcpy(ip, "?");
+		return snprintf(out, cap, " [%s]:%u", ip, ntohs(port));
+	}
+	return snprintf(out, cap, " af=%u", family);
+}
+
 static void print_event(const struct event *event, int has_arg)
 {
 	const struct evdesc *desc = NULL;
+	char sabuf[64];
 	double rel;
 
 	if (event->kind < ARRAY_SIZE(evdescs))
@@ -507,13 +595,25 @@ static void print_event(const struct event *event, int has_arg)
 		printf(" %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
 		       s[0], s[1], s[2], s[3], sport,
 		       d[0], d[1], d[2], d[3], ntohs(dport));
+	} else if (event->kind == 8 || event->kind == 10) {
+		format_sockaddr(sabuf, sizeof(sabuf), event->arg);
+		printf("%s", sabuf);
 	} else if (has_arg) {
 		printf(" %.*s", (int)sizeof(event->arg), event->arg);
+		if (event->kind == 4)
+			printf(" flags=0x%llx",
+			       (unsigned long long)event->aux);
 	} else if (event->kind == 2 && event->aux) {
 		printf(" life=%.3fms", event->aux / 1e6);
 	} else if (desc && desc->label) {
 		printf(" %s=%llu", desc->label,
 		       (unsigned long long)event->aux);
+	}
+	if (has_ret(event->kind)) {
+		if (event->ret < 0)
+			printf(" = -%s", strerror((int)-event->ret));
+		else
+			printf(" = %lld", (long long)event->ret);
 	}
 	putchar('\n');
 }
@@ -600,13 +700,18 @@ static void event_summary(char *out, int cap, const struct event *event,
 			 " %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
 			 s[0], s[1], s[2], s[3], sport,
 			 d[0], d[1], d[2], d[3], ntohs(dport));
+	} else if (event->kind == 8 || event->kind == 10) {
+		format_sockaddr(out + off, cap - off, event->arg);
 	} else if (has_arg) {
 		int room = cap - off - 1;
+		int n = snprintf(out + off, cap - off, " %.*s",
+				 room < (int)sizeof(event->arg) ? room
+							        : (int)sizeof(event->arg),
+				 event->arg);
 
-		snprintf(out + off, cap - off, " %.*s",
-			 room < (int)sizeof(event->arg) ? room
-						        : (int)sizeof(event->arg),
-			 event->arg);
+		if (event->kind == 4 && n > 0 && off + n < cap - 1)
+			snprintf(out + off + n, cap - off - n, " flags=0x%llx",
+				 (unsigned long long)event->aux);
 	} else if (event->kind == 2 && event->aux) {
 		snprintf(out + off, cap - off, " life=%.3fms",
 			 event->aux / 1e6);
@@ -614,6 +719,14 @@ static void event_summary(char *out, int cap, const struct event *event,
 		snprintf(out + off, cap - off, " %s=%llu", desc->label,
 			 (unsigned long long)event->aux);
 	}
+
+	if (event->kind == 6 && show_data) {
+		int len = strlen(out);
+
+		format_data(out + len, cap - len, event->arg, 48);
+	}
+	if (has_ret(event->kind))
+		append_ret(out, cap, event);
 }
 
 static void detail_capture(const struct event *event, int has_arg)
@@ -862,6 +975,34 @@ static int read_comm(uint32_t pid, char *buf, int len)
 	return 0;
 }
 
+static uint32_t read_ppid(uint32_t pid)
+{
+	char path[64], buf[256], *p;
+	int fd;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "/proc/%u/stat", pid);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	p = strrchr(buf, ')');		/* comm can hold spaces/parens */
+	if (!p)
+		return 0;
+	p++;
+	while (*p == ' ')
+		p++;
+	while (*p && *p != ' ')		/* skip state */
+		p++;
+	while (*p == ' ')
+		p++;
+	return (uint32_t)strtoul(p, NULL, 10);
+}
+
 static uint64_t prev_total(uint32_t pid)
 {
 	int i;
@@ -937,102 +1078,256 @@ static char *append_u64(char *p, uint64_t v, int width)
 static char *render_tabs(char *p, int view)
 {
 	p = append(p, "\033[K asm-ebpf   ");
-	p = append(p, view == 1 ? "[1 counts]" : " 1 counts ");
+	p = append(p, view == 1 ? "[1 tree]" : " 1 tree ");
 	p = append(p, view == 2 ? "[2 pids]" : " 2 pids ");
-	p = append(p, view == 3 ? "[3 latency]" : " 3 latency ");
+	p = append(p, view == 3 ? "[3 net]" : " 3 net ");
 	return p;
 }
 
-static void render_counts(int rows)
+struct tnode {
+	uint32_t pid;
+	uint32_t ppid;
+};
+
+static struct tnode tnodes[4096];
+static int ntnodes;
+
+static int tracked_pid(uint32_t pid)
+{
+	int i;
+
+	for (i = 0; i < ntnodes; i++)
+		if (tnodes[i].pid == pid)
+			return 1;
+	return 0;
+}
+
+static char *tree_node(char *p, int idx, const char *prefix, int is_last,
+		       int is_root, int depth, int rows, int *line)
+{
+	char comm[32], childpfx[256];
+	int i, kids = 0, seen = 0;
+
+	if (*line >= rows - 1 || depth > 32)
+		return p;
+	p = append(p, "\033[K ");
+	p = append(p, prefix);
+	if (!is_root)
+		p = append(p, is_last ? "\342\224\224\342\224\200 "
+				      : "\342\224\234\342\224\200 ");
+	if (read_comm(tnodes[idx].pid, comm, sizeof(comm)))
+		strcpy(comm, "?");
+	p = append(p, comm);
+	p = append(p, "(");
+	p = append_u64(p, tnodes[idx].pid, 0);
+	p = append(p, ")\r\n");
+	(*line)++;
+
+	if (is_root)
+		snprintf(childpfx, sizeof(childpfx), "%.240s", prefix);
+	else
+		snprintf(childpfx, sizeof(childpfx), "%.240s%s", prefix,
+			 is_last ? "   " : "\342\224\202  ");
+
+	for (i = 0; i < ntnodes; i++)
+		if (tnodes[i].ppid == tnodes[idx].pid && i != idx)
+			kids++;
+	for (i = 0; i < ntnodes && *line < rows - 1; i++)
+		if (tnodes[i].ppid == tnodes[idx].pid && i != idx)
+			p = tree_node(p, i, childpfx, ++seen == kids, 0,
+				      depth + 1, rows, line);
+	return p;
+}
+
+static void render_tree(int rows)
 {
 	static char buf[65536];
 	char *p = buf;
-	size_t i;
-	int line = 2;
+	int i, line = 1;
+
+	ntnodes = snapshot_pids();
+	for (i = 0; i < ntnodes; i++) {
+		tnodes[i].pid = rows_cur[i].pid;
+		tnodes[i].ppid = read_ppid(rows_cur[i].pid);
+	}
 
 	p = render_tabs(p, 1);
-	p = append(p, "   q:quit p:pause\r\n");
-	p = append(p, "\033[K ");
-	p = append_pad(p, "event", 10);
-	p = append_pad(p, "count", 14);
-	p = append(p, "bytes\r\n");
-
-	for (i = 0; i < ARRAY_SIZE(evdescs) && line < rows - 1; i++) {
-		uint64_t value, bytes = 0;
-
-		if (!evdescs[i].name || lookup_stat(count_fd, i, &value))
-			continue;
-		if (!value)
-			continue;
-		lookup_stat(bytes_fd, i, &bytes);
-		p = append(p, "\033[K ");
-		p = append_pad(p, evdescs[i].name, 10);
-		p = append_u64(p, value, 14);
-		if (bytes)
-			p = append_u64(p, bytes, 0);
-		p = append(p, "\r\n");
-		line++;
-	}
+	p = append(p, "  process tree (tracked pids)\r\n");
+	for (i = 0; i < ntnodes && line < rows - 1; i++)
+		if (!tracked_pid(tnodes[i].ppid))
+			p = tree_node(p, i, "", 0, 1, 0, rows, &line);
 	p = append(p, "\033[J");
 	tui_render(buf, p - buf);
 }
 
-static void render_hist(int rows)
+static char *hexaddr(char *p, unsigned ip, unsigned port)
+{
+	char num[24];
+
+	num[tui_u64(num, ip & 0xff)] = '\0';
+	p = append(p, num);
+	p = append(p, ".");
+	num[tui_u64(num, (ip >> 8) & 0xff)] = '\0';
+	p = append(p, num);
+	p = append(p, ".");
+	num[tui_u64(num, (ip >> 16) & 0xff)] = '\0';
+	p = append(p, num);
+	p = append(p, ".");
+	num[tui_u64(num, (ip >> 24) & 0xff)] = '\0';
+	p = append(p, num);
+	p = append(p, ":");
+	num[tui_u64(num, port)] = '\0';
+	return append(p, num);
+}
+
+struct sockowner {
+	unsigned long inode;
+	uint32_t pid;
+};
+
+static struct sockowner sockowners[16384];
+static int nsockowners;
+
+static void scan_sockets(void)
+{
+	DIR *pd;
+	struct dirent *pe;
+
+	nsockowners = 0;
+	pd = opendir("/proc");
+	if (!pd)
+		return;
+	while ((pe = readdir(pd)) &&
+	       nsockowners < (int)ARRAY_SIZE(sockowners)) {
+		char fdpath[64], *end;
+		unsigned long pid = strtoul(pe->d_name, &end, 10);
+		DIR *fdd;
+		struct dirent *fe;
+
+		if (*end)
+			continue;
+		snprintf(fdpath, sizeof(fdpath), "/proc/%lu/fd", pid);
+		fdd = opendir(fdpath);
+		if (!fdd)
+			continue;
+		while ((fe = readdir(fdd)) &&
+		       nsockowners < (int)ARRAY_SIZE(sockowners)) {
+			char link[96], target[64];
+			ssize_t n;
+
+			snprintf(link, sizeof(link), "%.72s/%.20s", fdpath,
+				 fe->d_name);
+			n = readlink(link, target, sizeof(target) - 1);
+			if (n <= 0)
+				continue;
+			target[n] = '\0';
+			if (strncmp(target, "socket:[", 8))
+				continue;
+			sockowners[nsockowners].inode =
+				strtoul(target + 8, NULL, 10);
+			sockowners[nsockowners].pid = (uint32_t)pid;
+			nsockowners++;
+		}
+		closedir(fdd);
+	}
+	closedir(pd);
+}
+
+static uint32_t sock_pid(unsigned long inode)
+{
+	int i;
+
+	for (i = 0; i < nsockowners; i++)
+		if (sockowners[i].inode == inode)
+			return sockowners[i].pid;
+	return 0;
+}
+
+static const char *tcp_state(unsigned st)
+{
+	static const char *const s[] = {
+		"", "ESTAB", "SYN_SENT", "SYN_RECV", "FIN_WAIT1",
+		"FIN_WAIT2", "TIME_WAIT", "CLOSE", "CLOSE_WAIT",
+		"LAST_ACK", "LISTEN", "CLOSING"
+	};
+
+	return st < ARRAY_SIZE(s) ? s[st] : "?";
+}
+
+static char *net_file(char *p, const char *path, const char *proto,
+		      int rows, int *line)
+{
+	char row[320];
+	FILE *f = fopen(path, "r");
+
+	if (!f)
+		return p;
+	if (!fgets(row, sizeof(row), f)) {	/* header */
+		fclose(f);
+		return p;
+	}
+	while (*line < rows - 1 && fgets(row, sizeof(row), f)) {
+		unsigned laddr, lport, raddr, rport, st;
+		unsigned long inode = 0;
+		uint32_t pid;
+		char who[32], comm[16];
+
+		if (sscanf(row,
+			   "%*d: %x:%x %x:%x %x %*x:%*x %*x:%*x %*x %*u %*u %lu",
+			   &laddr, &lport, &raddr, &rport, &st, &inode) != 6)
+			continue;
+		if (!raddr && st != 0x0a)	/* skip closed non-listeners */
+			continue;
+		pid = sock_pid(inode);
+		if (pid && !read_comm(pid, comm, sizeof(comm)))
+			snprintf(who, sizeof(who), "%u/%.15s", pid, comm);
+		else
+			strcpy(who, "-");
+
+		p = append(p, "\033[K ");
+		p = append_pad(p, proto, 4);
+		p = append_pad(p, who, 20);
+		p = hexaddr(p, laddr, lport);
+		p = append(p, " -> ");
+		p = hexaddr(p, raddr, rport);
+		p = append(p, "  ");
+		p = append(p, tcp_state(st));
+		p = append(p, "\r\n");
+		(*line)++;
+	}
+	fclose(f);
+	return p;
+}
+
+static void render_net(int rows)
 {
 	static char buf[65536];
-	uint64_t slots[HIST_SLOTS] = { 0 };
-	uint64_t max = 0;
 	char *p = buf;
-	int i, hi = 0, line = 2;
+	int line = 1;
 
-	for (i = 0; i < HIST_SLOTS; i++) {
-		if (lookup_stat(hist_fd, i, &slots[i]))
-			continue;
-		if (slots[i]) {
-			hi = i;
-			if (slots[i] > max)
-				max = slots[i];
-		}
-	}
-
+	scan_sockets();
 	p = render_tabs(p, 3);
-	p = append(p, "   read latency (ns)\r\n");
-	if (!max) {
-		p = append(p, "\033[K (no samples yet)\r\n\033[J");
-		tui_render(buf, p - buf);
-		return;
-	}
-	for (i = 0; i <= hi && line < rows - 1; i++) {
-		uint64_t lo = i ? 1ULL << i : 0;
-		uint64_t up = i < 63 ? (1ULL << (i + 1)) - 1 : ~0ULL;
-		int bar = (int)(slots[i] * 40 / max);
-		int j;
-
-		p = append(p, "\033[K ");
-		p = append_u64(p, lo, 12);
-		p = append(p, " ");
-		p = append_u64(p, up, 14);
-		p = append(p, " |");
-		for (j = 0; j < bar; j++)
-			*p++ = '*';
-		p = append(p, " ");
-		p = append_u64(p, slots[i], 0);
-		p = append(p, "\r\n");
-		line++;
-	}
+	p = append(p, "  network connections (pid/comm)\r\n");
+	p = net_file(p, "/proc/net/tcp", "tcp", rows, &line);
+	p = net_file(p, "/proc/net/udp", "udp", rows, &line);
 	p = append(p, "\033[J");
 	tui_render(buf, p - buf);
 }
 
-static void render_top(int rows, const char *filter, int filt_mode, int sel)
+static void render_top(int rows, const char *filter, int filt_mode, int sel,
+		       int paused)
 {
 	static char buf[65536];
 	char comm[32];
 	char *p = buf;
 	int n, i, shown = 0, limit;
 
-	n = snapshot_pids();
-	qsort(rows_cur, n, sizeof(rows_cur[0]), by_rate);
+	if (paused) {
+		n = nr_prev;		/* freeze data; arrows just move sel */
+	} else {
+		n = snapshot_pids();
+		qsort(rows_cur, n, sizeof(rows_cur[0]), by_rate);
+	}
 
 	p = render_tabs(p, 2);
 	if (filt_mode) {
@@ -1043,6 +1338,7 @@ static void render_top(int rows, const char *filter, int filt_mode, int sel)
 		p = append(p, "  filter=");
 		p = append(p, filter);
 	}
+	p = append(p, paused ? "  [paused]" : "");
 	p = append(p, "   up/dn+enter:detail q:quit /:filter\r\n");
 	p = append(p, "\033[K  ");
 	p = append_pad(p, "pid", 10);
@@ -1072,8 +1368,10 @@ static void render_top(int rows, const char *filter, int filt_mode, int sel)
 
 	tui_render(buf, p - buf);
 
-	memcpy(rows_prev, rows_cur, n * sizeof(rows_cur[0]));
-	nr_prev = n;
+	if (!paused) {
+		memcpy(rows_prev, rows_cur, n * sizeof(rows_cur[0]));
+		nr_prev = n;
+	}
 }
 
 static int by_seq_desc(const void *a, const void *b)
@@ -1104,7 +1402,34 @@ static void render_detail(int rows)
 	p = append(p, comm);
 	p = append(p, "  f:kinds=");
 	p = append(p, km_name[detail_km]);
+	p = append(p, show_data ? "  d:data=on" : "  d:data=off");
 	p = append(p, "   esc:back p:pause q:quit\r\n");
+
+	p = append(p, "\033[K parents: ");
+	p = append(p, comm);
+	{
+		uint32_t pp = detail_pid;
+		int depth;
+
+		for (depth = 0; depth < 8; depth++) {
+			uint32_t up = read_ppid(pp);
+			char pc[32];
+
+			if (!up || up == pp)
+				break;
+			p = append(p, " <- ");
+			if (read_comm(up, pc, sizeof(pc)))
+				strcpy(pc, "?");
+			p = append(p, pc);
+			p = append(p, "(");
+			p = append_u64(p, up, 0);
+			p = append(p, ")");
+			if (up == 1)
+				break;
+			pp = up;
+		}
+	}
+	p = append(p, "\r\n");
 
 	p = append(p, "\033[K ");
 	for (i = 0; i < (int)ARRAY_SIZE(detail_kind); i++) {
@@ -1263,7 +1588,8 @@ static int tui_loop(void)
 				if (key == 'f') {
 					detail_km = (detail_km + 1) % KM_COUNT;
 					apply_detail_filter();
-				}
+				} else if (key == 'd')
+					show_data = !show_data;
 				continue;
 			} else if (key == '1')
 				view = 1;
@@ -1296,11 +1622,12 @@ static int tui_loop(void)
 				render_detail(trows);
 		} else if (!paused || dirty) {
 			if (view == 1)
-				render_counts(trows);
+				render_tree(trows);
 			else if (view == 3)
-				render_hist(trows);
+				render_net(trows);
 			else
-				render_top(trows, filter, filt_mode, sel);
+				render_top(trows, filter, filt_mode, sel,
+					   paused);
 		}
 	}
 
@@ -1480,6 +1807,9 @@ static int load_program(struct target *target)
 		goto err;
 	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 6, pidstat_fd) &&
 	    (target->head || errno != ENOENT))
+		goto err;
+	if (patch_map_fd(insns, attr.insn_cnt, BPF_REG_1, 7, pending_fd) &&
+	    errno != ENOENT)
 		goto err;
 	attr.insns = (uint64_t)((char *)img.data + prog->sh_offset);
 	attr.license = (uint64_t)((char *)img.data + license->sh_offset);
@@ -1710,6 +2040,7 @@ static void detach_all(void)
 	close_fd(&hist_fd);
 	close_fd(&startlat_fd);
 	close_fd(&pidstat_fd);
+	close_fd(&pending_fd);
 }
 
 static void usage(const char *prog)
@@ -1778,8 +2109,10 @@ int main(int argc, char **argv)
 	hist_fd = create_hist_map();
 	startlat_fd = create_startlat_map();
 	pidstat_fd = create_pidstat_map();
+	pending_fd = create_pending_map();
 	if (count_fd < 0 || bytes_fd < 0 || start_fd < 0 ||
-	    hist_fd < 0 || startlat_fd < 0 || pidstat_fd < 0) {
+	    hist_fd < 0 || startlat_fd < 0 || pidstat_fd < 0 ||
+	    pending_fd < 0) {
 		die_errno("stat map");
 		detach_all();
 		free(sel);

@@ -22,7 +22,7 @@ trace_tcp_connect:
 	ldxh %r2, [%r10+-196]
 	lsh %r2, 32
 	or %r1, %r2
-	stxdw [%r10+-152], %r1
+	stxdw [%r10+-160], %r1
 	mov %r1, %r10
 	add %r1, -204
 	mov %r2, 4
@@ -40,7 +40,7 @@ trace_tcp_connect:
 	lsh %r2, 32
 	or %r1, %r2
 	stxdw [%r10+-128], %r1
-	event_out 56
+	event_out 64
 
 	.section "license", "a"
 _license:

@@ -5,7 +5,12 @@
 	.section "tracepoint/syscalls/sys_enter_openat", "ax"
 	.global trace_openat
 trace_openat:
-	emit_str 4, 24
+	enter_str_aux 4, 24, 32
+
+	.section "tracepoint/syscalls/sys_exit_openat", "ax"
+	.global trace_openat_exit
+trace_openat_exit:
+	emit_exit_ret
 
 	.section "license", "a"
 _license:

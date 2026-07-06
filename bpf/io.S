@@ -10,7 +10,7 @@ trace_read:
 	.section "tracepoint/syscalls/sys_enter_write", "ax"
 	.global trace_write
 trace_write:
-	emit_io 6, 16, 32
+	emit_io_data 6, 16, 32, 24
 
 	.section "tracepoint/syscalls/sys_enter_close", "ax"
 	.global trace_close
