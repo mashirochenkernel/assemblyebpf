@@ -296,6 +296,76 @@
 	event_out 184
 	.endm
 
+	.macro emit_argv kind, argvoff
+	event_head \kind
+	mov %r1, %r7
+	rsh %r1, 32
+	stxw [%r10+-192], %r1
+	ldxdw %r1, [%r10+-168]
+	stxdw [%r10+-200], %r1
+	lddw %r1, 3
+	mov %r2, %r10
+	add %r2, -192
+	mov %r3, %r10
+	add %r3, -200
+	mov %r4, 0
+	call 2
+	zero_arg
+	ldxdw %r8, [%r6+\argvoff]
+	mov %r1, 0
+	stxdw [%r10+-200], %r1
+	mov %r1, %r10
+	add %r1, -200
+	mov %r2, 8
+	mov %r3, %r8
+	call 112
+	ldxdw %r3, [%r10+-200]
+	mov %r1, %r10
+	add %r1, -128
+	mov %r2, 32
+	call 114
+	mov %r1, 0
+	stxdw [%r10+-200], %r1
+	mov %r1, %r10
+	add %r1, -200
+	mov %r2, 8
+	mov %r3, %r8
+	add %r3, 8
+	call 112
+	ldxdw %r3, [%r10+-200]
+	mov %r1, %r10
+	add %r1, -96
+	mov %r2, 32
+	call 114
+	mov %r1, 0
+	stxdw [%r10+-200], %r1
+	mov %r1, %r10
+	add %r1, -200
+	mov %r2, 8
+	mov %r3, %r8
+	add %r3, 16
+	call 112
+	ldxdw %r3, [%r10+-200]
+	mov %r1, %r10
+	add %r1, -64
+	mov %r2, 32
+	call 114
+	mov %r1, 0
+	stxdw [%r10+-200], %r1
+	mov %r1, %r10
+	add %r1, -200
+	mov %r2, 8
+	mov %r3, %r8
+	add %r3, 24
+	call 112
+	ldxdw %r3, [%r10+-200]
+	mov %r1, %r10
+	add %r1, -32
+	mov %r2, 32
+	call 114
+	event_out 184
+	.endm
+
 	.macro emit_exit kind
 	event_head \kind
 	mov %r1, %r7

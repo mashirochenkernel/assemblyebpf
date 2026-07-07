@@ -45,9 +45,13 @@ It keeps running until interrupted.  It needs the usual privileges for loading
 eBPF programs and opening tracing events.
 
 On a terminal the loader shows a live full-screen view, refreshed in place.
-Three overview tabs switch with 1, 2 and 3: the tree of tracked processes drawn
-with the usual branch characters, the busiest pids, and the network connections
-from procfs with the owning pid and command and the socket state.  In the pid
+Four overview tabs switch with 1, 2, 3 and 4: the tree of tracked processes
+drawn with the usual branch characters, the busiest pids, the network
+connections from procfs with the owning pid and command and the socket state,
+and a log of recent exec calls newest first with the full command line.  The
+exec log is kept because a short-lived command execs and exits before it can be
+found in the pid list, so it would otherwise never be seen; the log holds the
+last commands so their argv is there to read after the fact.  In the pid
 view p freezes the list so the arrows can move the highlight without the numbers
 shifting underneath.  In the pid view the up
 and down arrows move the highlight and enter opens a detail view for that pid;
@@ -61,9 +65,27 @@ events keep flowing; d toggles the write-buffer preview.  While the detail view
 is open the overview tabs only count that pid; counters resume when it closes.
 Lists longer than the screen scroll: the arrows and page keys move through the
 tree, the connections and a pid's operations, and a footer shows the position.
+In the detail view r reads memory from the process itself: type a user-space
+address and a program on the syscall entry tracepoint, which runs in the
+target's own context, copies bytes from that address with bpf_probe_read_user
+and hands them back, shown as a hex and ascii dump that refreshes on every
+syscall the process makes.  This is only possible because the probe executes as
+the traced task, so its address space is the current one; the read is armed for
+the inspected pid alone and cleared on leaving the view.  The probe sits on
+every syscall entry, so it is a system-wide cost while the tool runs.
+
+In the detail view m switches the lower half from the operation list to a
+behaviour fingerprint: a table of which syscall followed which, prev -> next,
+ordered by how often the pair occurred.  It is built from the pid's own event
+stream, so a process that reads then writes in a loop and one that connects then
+sends look different at a glance, and a familiar program that starts doing
+something new stands out.  The same syscall arrives once per per-cpu program
+copy and shares its nanosecond timestamp, so the count follows the timestamp and
+each syscall is counted once.
+
 Keys: q quit or leave detail, esc leave detail, p pause, f kinds, d data,
-x inject (detail), / filter and t tripwire (pid view), arrows/pgup/pgdn scroll.
-The per-kind counts and latency histogram are printed on exit.
+x inject, m fingerprint and r read-memory (detail), / filter and t tripwire (pids),
+arrows/pgup/pgdn scroll.  The per-kind counts and latency histogram print on exit.
 The terminal handling and rendering are hand-written x86-64 assembly in tui.S.
 When stdout is not a terminal, or with --no-tui, the loader streams one line
 per event instead:
@@ -124,6 +146,13 @@ atomically counts its events by kind, and the read, write, sendto and recvfrom
 programs accumulate the requested byte counts.  Each program also counts its
 events per pid.  On exit the loader prints the per-kind event counts, the byte
 totals for the I/O kinds, and the busiest pids.
+
+The execve program walks the argv array in the kernel: it reads the argument
+vector pointer from the tracepoint, follows the first four user pointers, and
+copies each string with bpf_probe_read_user_str into its own slot, so the event
+carries the command line and not just the program path.  The loader joins the
+slots, so an exec shows curl -Lo /dev/null <url> rather than a bare /usr/bin/curl.
+Each argument is capped and a trailing ... marks a longer line.
 
 The execve program stores a start timestamp keyed by pid, and the process exit
 program looks it up to report the process lifetime as life=<ms> on the exit

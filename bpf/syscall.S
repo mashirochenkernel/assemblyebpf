@@ -5,7 +5,7 @@
 	.section "tracepoint/syscalls/sys_enter_execve", "ax"
 	.global trace_execve
 trace_execve:
-	emit_exec 1, 16
+	emit_argv 1, 24
 
 	.section "license", "a"
 _license:

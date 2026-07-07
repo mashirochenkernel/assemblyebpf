@@ -72,6 +72,9 @@ struct filter {
 	uint32_t pad2;
 	int64_t inject_ret;
 	char trip_path[64];
+	uint64_t peek_addr;
+	uint32_t peek_pid;
+	uint32_t pad3;
 };
 
 struct image {
@@ -148,6 +151,7 @@ static struct target targets[] = {
 	LAT("bpf/lat.o", "syscalls/sys_enter_read"),
 	LAT("bpf/lat.o", "syscalls/sys_exit_read"),
 	LAT("bpf/off.o", "sched/sched_switch"),
+	LAT("bpf/peek.o", "raw_syscalls/sys_enter"),
 };
 
 static const struct evdesc {
@@ -189,6 +193,7 @@ static const struct evdesc {
 	[33] = { "vfsopen",  NULL },
 	[34] = { "vfsunlink", NULL },
 	[35] = { "connreq", NULL },
+	[36] = { "peek",   NULL },
 };
 
 static int events_fd = -1;
@@ -760,6 +765,90 @@ static int format_sockaddr(char *out, int cap, const char *sa)
 	return snprintf(out, cap, " af=%u", family);
 }
 
+static int format_argv(char *out, int cap, const char *arg)
+{
+	int i, w = 0;
+
+	for (i = 0; i < 4 && w < cap - 1; i++) {
+		const char *s = arg + i * 32;
+		char slot[33];
+
+		memcpy(slot, s, 32);
+		slot[32] = '\0';
+		if (!slot[0])
+			break;
+		w += snprintf(out + w, cap - w, "%s%s", i ? " " : " ", slot);
+	}
+	if (i == 4 && w < cap - 4)
+		w += snprintf(out + w, cap - w, " ...");
+	out[w < cap ? w : cap - 1] = '\0';
+	return w;
+}
+
+struct execrec {
+	uint32_t pid;
+	uint64_t ts;
+	char cmd[168];
+};
+
+#define EXEC_RING	128
+static struct execrec exec_ring[EXEC_RING];
+static unsigned exec_head;	/* monotonic count of execs recorded */
+
+static void note_exec(const struct event *event)
+{
+	uint32_t pid = event->pid_tgid >> 32;
+	char cmd[168];
+	struct execrec *r;
+	unsigned char *c;
+	int back;
+
+	format_argv(cmd, sizeof(cmd), event->arg);
+	for (c = (unsigned char *)cmd; *c; c++)
+		if (*c < 0x20 || *c >= 0x7f)	/* argv is untrusted: no
+						   control or escape bytes into
+						   the live view */
+			*c = '.';
+
+	/*
+	 * A single execve is delivered once per per-cpu program copy, so the
+	 * same command arrives in a tight burst.  Collapse identical pid+cmd
+	 * within a short window; a genuine re-exec seconds later still shows.
+	 */
+	for (back = 1; back <= 32 && back <= (int)exec_head; back++) {
+		struct execrec *q =
+			&exec_ring[(exec_head - back) & (EXEC_RING - 1)];
+		uint64_t dt = event->ts > q->ts ?
+			      event->ts - q->ts : q->ts - event->ts;
+
+		if (q->pid == pid && dt < 100000000ULL && !strcmp(q->cmd, cmd))
+			return;
+	}
+
+	if (!start_ts || event->ts < start_ts)
+		start_ts = event->ts;
+
+	r = &exec_ring[exec_head & (EXEC_RING - 1)];
+	r->pid = pid;
+	r->ts = event->ts;
+	memcpy(r->cmd, cmd, sizeof(r->cmd));
+	exec_head++;
+}
+
+static uint64_t peek_addr;		/* armed user address, 0 = off */
+static uint64_t peek_result_addr;
+static unsigned char peek_data[64];
+static int peek_have;
+static int peek_mode;			/* typing an address */
+static char peek_buf[24];
+
+static void note_peek(const struct event *event)
+{
+	peek_result_addr = event->aux;
+	memcpy(peek_data, event->arg, sizeof(peek_data));
+	peek_have = 1;
+}
+
 static void print_event(const struct event *event, int has_arg)
 {
 	const struct evdesc *desc = NULL;
@@ -796,6 +885,11 @@ static void print_event(const struct event *event, int has_arg)
 	} else if (event->kind == 8 || event->kind == 10) {
 		format_sockaddr(sabuf, sizeof(sabuf), event->arg);
 		printf("%s", sabuf);
+	} else if (event->kind == 1 && has_arg) {
+		char cmd[160];
+
+		format_argv(cmd, sizeof(cmd), event->arg);
+		printf("%s", cmd);
 	} else if (has_arg) {
 		printf(" %.*s", (int)sizeof(event->arg), event->arg);
 		if (event->kind == 4)
@@ -850,6 +944,12 @@ static uint64_t detail_seq;
 static uint64_t detail_kind[ARRAY_SIZE(evdescs)];
 static uint32_t detail_pid;
 
+#define TK ARRAY_SIZE(evdescs)
+static uint32_t trans[TK][TK];		/* prev-syscall -> next-syscall counts */
+static int trans_prev = -1;
+static uint64_t trans_last_ts;
+static int show_matrix;			/* detail view: 'm' toggles fingerprint */
+
 enum { KM_ALL, KM_NORW, KM_NETFILE, KM_COUNT };
 static const char *km_name[KM_COUNT] = { "all", "no-rw", "net+file" };
 static int detail_km;
@@ -883,6 +983,9 @@ static void detail_reset(uint32_t pid)
 	fdcache_clear();
 	memset(detail_rows, 0, sizeof(detail_rows));
 	memset(detail_kind, 0, sizeof(detail_kind));
+	memset(trans, 0, sizeof(trans));
+	trans_prev = -1;
+	trans_last_ts = 0;
 }
 
 static void event_summary(char *out, int cap, const struct event *event,
@@ -918,6 +1021,8 @@ static void event_summary(char *out, int cap, const struct event *event,
 			 d[0], d[1], d[2], d[3], ntohs(dport));
 	} else if (event->kind == 8 || event->kind == 10) {
 		format_sockaddr(out + off, cap - off, event->arg);
+	} else if (event->kind == 1 && has_arg) {
+		format_argv(out + off, cap - off, event->arg);
 	} else if (has_arg) {
 		int room = cap - off - 1;
 		int n = snprintf(out + off, cap - off, " %.*s",
@@ -965,6 +1070,21 @@ static void detail_capture(const struct event *event, int has_arg)
 
 	if ((uint32_t)(event->pid_tgid >> 32) != detail_pid)
 		return;
+
+	/*
+	 * The same syscall is delivered once per per-cpu program copy and
+	 * shares its nanosecond timestamp; distinct syscalls never do.  Count
+	 * a behaviour transition only on the first delivery of each.
+	 */
+	if (event->ts != trans_last_ts) {
+		int k = event->kind < TK ? (int)event->kind : (int)TK - 1;
+
+		if (trans_prev >= 0)
+			trans[trans_prev][k]++;
+		trans_prev = k;
+		trans_last_ts = event->ts;
+	}
+
 	if (event->kind < ARRAY_SIZE(evdescs))
 		detail_kind[event->kind]++;
 
@@ -1145,25 +1265,33 @@ static void read_one(struct perf_reader *reader)
 
 			memcpy(&raw_len, buf + sizeof(*hdr), sizeof(raw_len));
 			if (raw_len >= EVENT_HEAD &&
-			    raw_len <= sizeof(struct event) &&
+			    raw_len <= sizeof(struct event) + 7 &&
 			    sizeof(*hdr) + 4 + raw_len <= len) {
-				if (detail_mode)
+				const struct event *ev =
+					(void *)(buf + sizeof(*hdr) + 4);
+
+				if (ev->kind == 1 &&
+				    raw_len >= sizeof(struct event))
+					note_exec(ev);
+				if (ev->kind == 36)
+					note_peek(ev);
+				else if (detail_mode)
 					detail_capture((void *)(buf + sizeof(*hdr) + 4),
 						       raw_len >= sizeof(struct event));
 				else if (!tui_on)
 					print_event((void *)(buf + sizeof(*hdr) + 4),
 						    raw_len >= sizeof(struct event));
-			} else if (!reported_bad_sample) {
+			} else if (!reported_bad_sample && !tui_on) {
 				fprintf(stderr, "bad sample size %u record %zu\n",
 					raw_len, len);
 				reported_bad_sample = 1;
 			}
 		} else if (hdr->type == PERF_RECORD_LOST) {
-			if (!reported_lost) {
+			if (!reported_lost && !tui_on) {
 				fprintf(stderr, "lost perf records\n");
 				reported_lost = 1;
 			}
-		} else if (!reported_record) {
+		} else if (!reported_record && !tui_on) {
 			fprintf(stderr, "perf record type %u size %u\n",
 				hdr->type, hdr->size);
 			reported_record = 1;
@@ -1382,6 +1510,7 @@ static char *render_tabs(char *p, int view)
 	p = append(p, view == 1 ? "[1 tree]" : " 1 tree ");
 	p = append(p, view == 2 ? "[2 pids]" : " 2 pids ");
 	p = append(p, view == 3 ? "[3 net]" : " 3 net ");
+	p = append(p, view == 4 ? "[4 exec]" : " 4 exec ");
 	return p;
 }
 
@@ -1640,6 +1769,34 @@ static void render_net(int rows, int *scroll)
 	tui_render(buf, p - buf);
 }
 
+static void render_exec(int rows, int cols, int *scroll)
+{
+	static char buf[65536];
+	struct win w = { *scroll, rows - 2, 0, 0 };
+	char *p = buf;
+	unsigned n = exec_head < EXEC_RING ? exec_head : EXEC_RING;
+	unsigned i;
+	int wid = cols > 8 && cols < 220 ? cols - 1 : 200;
+
+	p = render_tabs(p, 4);
+	p = append(p, "  recent exec, newest first  (short-lived commands land here)\r\n");
+	for (i = 0; i < n; i++) {
+		unsigned idx = (exec_head - 1 - i) & (EXEC_RING - 1);
+		struct execrec *r = &exec_ring[idx];
+		double t = start_ts && r->ts >= start_ts ?
+			   (r->ts - start_ts) / 1e9 : 0;
+		char line[224];
+
+		snprintf(line, sizeof(line), " %10.3f  pid=%-7u %s",
+			 t, r->pid, r->cmd);
+		line[wid] = '\0';		/* never wrap the terminal */
+		p = win_line(p, &w, line);
+	}
+	p = win_footer(p, &w);
+	win_clamp(&w, scroll);
+	tui_render(buf, p - buf);
+}
+
 static void render_top(int rows, const char *filter, int filt_mode,
 		       int trip_mode, int *sel, int *scroll, int paused)
 {
@@ -1735,6 +1892,21 @@ static int by_seq_desc(const void *a, const void *b)
 	return 0;
 }
 
+struct trow_edge {
+	uint32_t count;
+	short a, b;
+};
+
+static int by_trans_desc(const void *a, const void *b)
+{
+	uint32_t x = ((const struct trow_edge *)a)->count;
+	uint32_t y = ((const struct trow_edge *)b)->count;
+
+	if (x != y)
+		return y > x ? 1 : -1;
+	return 0;
+}
+
 static uint64_t sum_offcpu(uint32_t tgid)
 {
 	char path[64];
@@ -1765,7 +1937,7 @@ static void render_detail(int rows, int *scroll)
 	char comm[32];
 	char *p = buf;
 	int order[DETAIL_ROWS];
-	int i, col = 0, nrow = 0;
+	int i, col = 0, nrow = 0, peek_extra = 0;
 
 	if (read_comm(detail_pid, comm, sizeof(comm)))
 		strcpy(comm, "?");
@@ -1785,6 +1957,31 @@ static void render_detail(int rows, int *scroll)
 	p = append(p, "\033[K off-cpu (blocked, all threads): ");
 	p = append_u64(p, sum_offcpu(detail_pid) / 1000000, 0);
 	p = append(p, " ms\r\n");
+
+	if (peek_mode) {
+		peek_extra = 1;
+		p += sprintf(p, "\033[K peek user address: 0x%s_\r\n", peek_buf);
+	} else if (peek_addr) {
+		int row, b;
+
+		peek_extra = 5;
+		p += sprintf(p, "\033[K peek user 0x%llx  (r: set addr)%s\r\n",
+			     (unsigned long long)peek_addr,
+			     peek_have ? "" : "  waiting for a syscall...");
+		for (row = 0; row < 4; row++) {
+			char asc[17];
+
+			p += sprintf(p, "\033[K  +%02x  ", row * 16);
+			for (b = 0; b < 16; b++) {
+				unsigned char v = peek_data[row * 16 + b];
+
+				p += sprintf(p, "%02x ", v);
+				asc[b] = v >= 0x20 && v < 0x7f ? v : '.';
+			}
+			asc[16] = '\0';
+			p += sprintf(p, " %s\r\n", peek_have ? asc : "");
+		}
+	}
 
 	p = append(p, "\033[K parents: ");
 	p = append(p, comm);
@@ -1823,27 +2020,59 @@ static void render_detail(int rows, int *scroll)
 		if (++col % 6 == 0)
 			p = append(p, "\r\n\033[K ");
 	}
-	p = append(p, "\r\n\033[K --- operations (repeats collapsed) ---\r\n");
-
-	for (i = 0; i < DETAIL_ROWS; i++)
-		if (detail_rows[i].count)
-			order[nrow++] = i;
-	qsort(order, nrow, sizeof(order[0]), by_seq_desc);
+	p = append(p, show_matrix ?
+		   "\r\n\033[K --- behaviour fingerprint: prev -> next syscall  (m: ops) ---\r\n"
+		 : "\r\n\033[K --- operations (repeats collapsed)  (m: fingerprint) ---\r\n");
 
 	w.scroll = *scroll;
-	w.visible = rows > 7 ? rows - 6 : 1;
+	w.visible = rows > 7 + peek_extra ? rows - 6 - peek_extra : 1;
 	w.ln = 0;
 	w.total = 0;
-	for (i = 0; i < nrow; i++) {
-		struct drow *r = &detail_rows[order[i]];
-		char line[160], *lp = line, num[24];
 
-		lp = append(lp, " x");
-		num[tui_u64(num, r->count)] = '\0';
-		lp = append_pad(lp, num, 9);
-		lp = append(lp, r->text);
-		*lp = '\0';
-		p = win_line(p, &w, line);
+	if (show_matrix) {
+		static struct trow_edge edges[TK * TK];
+		int ne = 0, a, b;
+
+		for (a = 0; a < (int)TK; a++)
+			for (b = 0; b < (int)TK; b++)
+				if (trans[a][b]) {
+					edges[ne].count = trans[a][b];
+					edges[ne].a = a;
+					edges[ne].b = b;
+					ne++;
+				}
+		qsort(edges, ne, sizeof(edges[0]), by_trans_desc);
+		for (i = 0; i < ne; i++) {
+			const char *an = evdescs[edges[i].a].name;
+			const char *bn = evdescs[edges[i].b].name;
+			char line[160], *lp = line, num[24];
+
+			lp = append(lp, " ");
+			lp = append_pad(lp, an ? an : "?", 10);
+			lp = append(lp, "-> ");
+			lp = append_pad(lp, bn ? bn : "?", 11);
+			lp = append(lp, "x");
+			num[tui_u64(num, edges[i].count)] = '\0';
+			lp = append(lp, num);
+			*lp = '\0';
+			p = win_line(p, &w, line);
+		}
+	} else {
+		for (i = 0; i < DETAIL_ROWS; i++)
+			if (detail_rows[i].count)
+				order[nrow++] = i;
+		qsort(order, nrow, sizeof(order[0]), by_seq_desc);
+		for (i = 0; i < nrow; i++) {
+			struct drow *r = &detail_rows[order[i]];
+			char line[160], *lp = line, num[24];
+
+			lp = append(lp, " x");
+			num[tui_u64(num, r->count)] = '\0';
+			lp = append_pad(lp, num, 9);
+			lp = append(lp, r->text);
+			*lp = '\0';
+			p = win_line(p, &w, line);
+		}
 	}
 	p = win_footer(p, &w);
 	win_clamp(&w, scroll);
@@ -1870,6 +2099,10 @@ static void apply_detail_filter(void)
 		f.inject_ret = -EACCES;
 	}
 	memcpy(f.trip_path, trip_path, sizeof(f.trip_path));
+	if (peek_addr) {
+		f.peek_addr = peek_addr;
+		f.peek_pid = detail_pid;
+	}
 	set_filter(config_fd, &f);
 }
 
@@ -1888,6 +2121,9 @@ static void enter_detail(uint32_t pid)
 	detail_reset(pid);
 	detail_km = KM_ALL;
 	inject_on = 0;			/* injection always starts disabled */
+	show_matrix = 0;
+	peek_addr = 0;
+	peek_have = 0;
 	apply_detail_filter();
 	detail_mode = 1;
 }
@@ -1935,8 +2171,8 @@ static int tui_loop(void)
 				break;
 			break;
 		}
-		if (in_detail && !paused)
-			drain_perf();
+		if (!paused)
+			drain_perf();		/* also feeds the exec log */
 
 		while ((key = tui_readkey()) >= 0) {
 			dirty = 1;
@@ -1973,6 +2209,25 @@ static int tui_loop(void)
 				} else if (l < (int)sizeof(trip_path) - 1) {
 					trip_path[l] = key;
 					trip_path[l + 1] = '\0';
+				}
+				continue;
+			}
+			if (peek_mode) {
+				int l = strlen(peek_buf);
+
+				if (key == '\r' || key == '\n') {
+					peek_mode = 0;
+					peek_addr = strtoull(peek_buf, NULL, 16);
+					peek_have = 0;
+					apply_detail_filter();
+				} else if (key == 127 || key == 8) {
+					if (l)
+						peek_buf[l - 1] = '\0';
+				} else if (key == 27) {
+					peek_mode = 0;
+				} else if (l < (int)sizeof(peek_buf) - 1) {
+					peek_buf[l] = key;
+					peek_buf[l + 1] = '\0';
 				}
 				continue;
 			}
@@ -2026,6 +2281,12 @@ static int tui_loop(void)
 				else if (key == 'x') {
 					inject_on = !inject_on;
 					apply_detail_filter();
+				} else if (key == 'm') {
+					show_matrix = !show_matrix;
+					scroll = 0;
+				} else if (key == 'r') {
+					peek_mode = 1;
+					peek_buf[0] = '\0';
 				}
 				continue;
 			} else if (key == '1') {
@@ -2036,6 +2297,9 @@ static int tui_loop(void)
 				scroll = 0;
 			} else if (key == '3') {
 				view = 3;
+				scroll = 0;
+			} else if (key == '4') {
+				view = 4;
 				scroll = 0;
 			}
 			else if (key == '/' && view == 2) {
@@ -2072,6 +2336,8 @@ static int tui_loop(void)
 				render_tree(trows, &scroll);
 			else if (view == 3)
 				render_net(trows, &scroll);
+			else if (view == 4)
+				render_exec(trows, tcols, &scroll);
 			else
 				render_top(trows, filter, filt_mode, trip_mode,
 					   &sel, &scroll, paused);
@@ -2487,7 +2753,17 @@ static void close_target(struct target *target)
 static void detach_all(void)
 {
 	size_t i;
+	int j;
 
+	/*
+	 * Detach every program first by closing all perf events, so nothing
+	 * keeps firing (the sched_switch probe runs on every context switch)
+	 * while the slower program frees and kprobe removals proceed.
+	 */
+	for (i = 0; i < ARRAY_SIZE(targets); i++)
+		for (j = 0; j < targets[i].nr_fds; j++)
+			if (targets[i].perf_fds)
+				close_fd(&targets[i].perf_fds[j]);
 	for (i = 0; i < ARRAY_SIZE(targets); i++)
 		close_target(&targets[i]);
 	close_readers();
@@ -2643,6 +2919,7 @@ int main(int argc, char **argv)
 		dump_hist();
 		dump_pidstat();
 	}
+	fprintf(stderr, "detaching per-cpu programs...\n");
 	detach_all();
 	return ret ? 1 : 0;
 }
